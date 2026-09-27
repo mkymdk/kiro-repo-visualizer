@@ -1,10 +1,12 @@
 {
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "repo-visualizer",
   "version": "1.0.0",
   "description": "Conventions, security rules, and architecture context for the GitHub Repository Visualizer — a tool that transforms a public GitHub repo into a narrated, downloadable MP4 video via a React + Express + ffmpeg pipeline.",
   "author": {
-    "name": "kiro-repo-visualizer"
+    "name": "mkymdk"
   },
+  "repository": "https://github.com/mkymdk/kiro-power-repo-visualizer",
   "keywords": [
     "repo-visualizer",
     "storyboard",
