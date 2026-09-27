@@ -35,11 +35,30 @@ interface StoryboardPreviewProps {
 // ---------------------------------------------------------------------------
 
 interface SortableSlideCardProps {
+  /** The slide rendered by this card. */
   slide: Slide;
+  /**
+   * Whether the remove button is enabled. `false` once the storyboard is at
+   * the `SLIDE_CONFIG.minSlides` floor, so the last removable slide cannot be
+   * deleted.
+   */
   canRemove: boolean;
+  /** Called with the slide's `id` when the user clicks "Remove". */
   onRemove: (id: string) => void;
 }
 
+/**
+ * A single draggable slide card within the storyboard list.
+ *
+ * Wraps `@dnd-kit`'s `useSortable` to expose a drag handle and applies the
+ * transform/opacity styling while the card is being dragged. The remove
+ * button is disabled when `canRemove` is `false`.
+ *
+ * @param slide - The slide rendered by this card.
+ * @param canRemove - Whether the remove button is enabled.
+ * @param onRemove - Called with the slide's `id` when removal is requested.
+ * @returns The list-item element for one sortable slide card.
+ */
 function SortableSlideCard({
   slide,
   canRemove,
