@@ -69,7 +69,19 @@ export function buildOutputPath(jobId: string): string {
  * duration stays within `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`.
  *
  * @param slideCount - The number of slides to render.
- * @returns Seconds per slide, clamped so that total duration is in bounds.
+ * @returns Seconds per slide — always at least 1. Chosen so the total
+ *   duration is close to `minDurationSeconds` for small slide counts and does
+ *   not exceed `maxDurationSeconds` until the count itself exceeds
+ *   `maxDurationSeconds`.
+ *
+ * @remarks
+ * The result is floored at 1 second. When `slideCount` exceeds
+ * `maxDurationSeconds` the total video will necessarily run longer than
+ * `maxDurationSeconds` (one second per slide is the minimum meaningful
+ * display time); returning 0 here would produce a zero-frame render that
+ * ffmpeg rejects. `generateStoryboard` caps storyboards at
+ * `SLIDE_CONFIG.maxSlides`, but the render route accepts a caller-supplied
+ * slide array, so this floor guards the unbounded input path.
  */
 export function calculateSecondsPerSlide(slideCount: number): number {
   if (slideCount <= 0) return VIDEO_CONFIG.minDurationSeconds;
@@ -80,9 +92,10 @@ export function calculateSecondsPerSlide(slideCount: number): number {
   // Try to spread evenly across minDuration first
   const ideal = Math.ceil(targetSeconds / slideCount);
 
-  // Clamp so total doesn't exceed maxDuration
+  // Clamp so total doesn't exceed maxDuration, but never drop below 1 second
+  // per slide (a 0 would yield a zero-frame render that ffmpeg rejects).
   const maxPerSlide = Math.floor(maxSeconds / slideCount);
-  return Math.min(ideal, maxPerSlide);
+  return Math.max(1, Math.min(ideal, maxPerSlide));
 }
 
 // ---------------------------------------------------------------------------
