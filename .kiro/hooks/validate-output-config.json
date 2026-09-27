@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Validate Output Config Constants",
+      "trigger": "PostFileSave",
+      "description": "Assert all approved spec constants (resolution, fps, codec, durations, slide counts) are present whenever the output config file is saved.",
+      "matcher": "src/config/output\\.(ts|js|py)$",
+      "action": {
+        "type": "command",
+        "command": "\nFILE=$(echo \"$KIRO_HOOK_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('file',''))\" 2>/dev/null)\nif [ -z \"$FILE\" ]; then exit 0; fi\n\necho \"=== Validating output config: $FILE ===\"\n\nERRORS=\"\"\n\ncheck() {\n  local label=\"$1\"\n  local pattern=\"$2\"\n  if ! grep -qP \"$pattern\" \"$FILE\"; then\n    ERRORS=\"$ERRORS\\n  ✗ $label\"\n  else\n    echo \"  ✓ $label\"\n  fi\n}\n\n# Video constants\ncheck \"width: 1280\"            \"1280\"\ncheck \"height: 720\"            \"720\"\ncheck \"fps: 30\"                \"\\b30\\b\"\ncheck \"codec: h264\"            \"h264\"\ncheck \"container: mp4\"         \"mp4\"\ncheck \"minDuration: 30s\"       \"\\b30\\b\"\ncheck \"maxDuration: 300s\"      \"\\b300\\b\"\ncheck \"maxFileSize: 200MB\"     \"200\\s*\\*\\s*1024\\s*\\*\\s*1024\\|209715200\"\ncheck \"progressInterval: 2000ms\" \"\\b2[_,]?000\\b\"\ncheck \"downloadReady: 5000ms\"  \"\\b5[_,]?000\\b\"\ncheck \"cancelTimeout: 3s\"      \"\\b3\\b\"\n\n# Slide constants\ncheck \"minSlides: 3\"           \"\\b3\\b\"\ncheck \"maxSlides: 15\"          \"\\b15\\b\"\ncheck \"previewMaxWords: 50\"    \"\\b50\\b\"\ncheck \"introMaxWords: 300\"     \"\\b300\\b\"\ncheck \"specMaxHeadings: 5\"     \"\\b5\\b\"\ncheck \"specMaxSentences: 3\"    \"\\b3\\b\"\ncheck \"maxHighlights: 10\"      \"\\b10\\b\"\n\nif [ -n \"$ERRORS\" ]; then\n  echo \"\"\n  echo \"❌ Output config validation FAILED. The following required constants are missing or incorrect:\"\n  printf \"$ERRORS\\n\"\n  echo \"\"\n  echo \"Expected values per spec:\"\n  echo \"  VIDEO: 1280x720, h264, mp4, 30fps, 30s–300s, 200MB limit, 2000ms progress, 5000ms download, 3s cancel\"\n  echo \"  SLIDES: min=3, max=15, previewWords=50, introWords=300, specHeadings=5, specSentences=3, highlights=10\"\n  exit 2\nfi\n\necho \"\"\necho \"✅ Output config is valid — all spec constants present.\"\n",
+        "timeout": 10
+      }
+    }
+  ]
+}

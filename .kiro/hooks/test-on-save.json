@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Run Tests on Save",
+      "trigger": "PostFileSave",
+      "description": "Run the test suite for the saved test file and report pass/fail.",
+      "matcher": "(tests?/.*\\.(ts|tsx|js|jsx|py)|\\.test\\.(ts|tsx|js|jsx)|\\.spec\\.(ts|tsx|js|jsx)|_test\\.py)$",
+      "action": {
+        "type": "command",
+        "command": "\nFILE=$(echo \"$KIRO_HOOK_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('file',''))\" 2>/dev/null)\nif [ -z \"$FILE\" ]; then exit 0; fi\n\necho \"=== Test run triggered by: $FILE ===\"\n\ncase \"$FILE\" in\n  *.ts|*.tsx|*.js|*.jsx)\n    if command -v npx &>/dev/null; then\n      # Vitest (preferred) or Jest — single run, no watch\n      if npx --no-install vitest --version &>/dev/null 2>&1; then\n        npx --no-install vitest run --reporter=verbose \"$FILE\" 2>&1\n      elif npx --no-install jest --version &>/dev/null 2>&1; then\n        npx --no-install jest --no-coverage --testPathPattern=\"$FILE\" 2>&1\n      else\n        echo \"No JS test runner found (vitest or jest). Skipping.\"\n      fi\n    fi\n    ;;\n  *.py)\n    if command -v pytest &>/dev/null; then\n      pytest -v \"$FILE\" 2>&1\n    else\n      echo \"pytest not found. Skipping.\"\n    fi\n    ;;\nesac\n\nSTATUS=$?\nif [ $STATUS -eq 0 ]; then\n  echo \"✅ Tests passed\"\nelse\n  echo \"❌ Tests failed (exit $STATUS)\"\nfi\nexit $STATUS\n",
+        "timeout": 60
+      }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "repo-visualizer",
+  "version": "1.0.0",
+  "description": "Conventions, security rules, and architecture context for the GitHub Repository Visualizer — a tool that transforms a public GitHub repo into a narrated, downloadable MP4 video via a React + Express + ffmpeg pipeline.",
+  "author": {
+    "name": "kiro-repo-visualizer"
+  },
+  "keywords": [
+    "repo-visualizer",
+    "storyboard",
+    "video export",
+    "github analyzer",
+    "github repository",
+    "repository analyzer",
+    "slide generation",
+    "video rendering",
+    "mp4",
+    "ffmpeg",
+    "storyboard preview",
+    "commit history",
+    "readme extraction"
+  ],
+  "license": "MIT"
+}

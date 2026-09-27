@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Lint & Format on Save",
+      "trigger": "PostFileSave",
+      "description": "Run ESLint (TS/JS) or ruff/black (Python) with auto-fix on every source file save.",
+      "matcher": "\\.(ts|tsx|js|jsx|py)$",
+      "action": {
+        "type": "command",
+        "command": "\nFILE=$(echo \"$KIRO_HOOK_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('file',''))\" 2>/dev/null)\nif [ -z \"$FILE\" ]; then exit 0; fi\n\ncase \"$FILE\" in\n  *.ts|*.tsx|*.js|*.jsx)\n    # Run ESLint with --fix if available, fall back gracefully\n    if command -v npx &>/dev/null; then\n      npx --no-install eslint --fix \"$FILE\" 2>&1 && echo \"ESLint: $FILE OK\" || echo \"ESLint: issues found in $FILE (see above)\"\n    else\n      echo \"ESLint: npx not found, skipping\"\n    fi\n    ;;\n  *.py)\n    # Prefer ruff (faster), fall back to black\n    if command -v ruff &>/dev/null; then\n      ruff check --fix \"$FILE\" 2>&1 && ruff format \"$FILE\" 2>&1 && echo \"ruff: $FILE OK\"\n    elif command -v black &>/dev/null; then\n      black \"$FILE\" 2>&1 && echo \"black: $FILE OK\"\n    else\n      echo \"No Python formatter found (ruff or black). Skipping.\"\n    fi\n    ;;\nesac\n",
+        "timeout": 30
+      }
+    }
+  ]
+}

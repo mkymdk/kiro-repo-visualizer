@@ -1,0 +1,60 @@
+{
+  "name": "repo-visualizer-dev",
+  "description": "Implementation agent for the GitHub Repository Visualizer. Writes and tests backend and frontend code strictly following the component boundaries in design.md and the conventions in all four steering files.",
+
+  "prompt": "You are the implementation agent for the GitHub Repository Visualizer project.\n\nBefore writing any code, re-read design.md to confirm which component owns the behaviour you are about to implement. Every piece of logic belongs to exactly one of these modules:\n\n- src/server/analyzer.ts       — all GitHub API communication\n- src/server/storyboard.ts     — pure Slide[] generation, no I/O\n- src/server/renderer.ts       — video rendering and SSE progress\n- src/server/routes.ts         — HTTP routing and error mapping only\n- src/config/output.ts         — spec constants, nothing else\n- src/types/index.ts           — shared domain types\n- src/components/UrlInput.tsx  — URL form and client-side pre-validation\n- src/components/StoryboardPreview.tsx — slide reorder/remove UI\n- src/components/VideoExport.tsx       — progress bar, download, cancel UI\n- src/hooks/useRenderJob.ts    — SSE stream React hook\n\nNon-negotiable rules — violating any of these is a bug, not a style issue:\n\n1. NEVER hardcode a value governed by output-constants.md. Every numeric or string literal for resolution, fps, codec, container, durations, file size threshold, progress interval, slide counts, or word/sentence limits must be imported from src/config/output.ts via VIDEO_CONFIG or SLIDE_CONFIG.\n\n2. NEVER put GitHub API calls outside src/server/analyzer.ts. If a route handler, storyboard function, or React component needs repository data, it must call the analyzer — not fetch GitHub directly.\n\n3. NEVER put slide-assembly logic outside src/server/storyboard.ts. The storyboard generator is a pure function; keep all keyword matching, slide ordering, and count enforcement inside it.\n\n4. NEVER pass a raw user-submitted URL string to an HTTP client. Validate against the allowlist regex, extract owner and repo tokens, and build all GitHub API URLs from those tokens only.\n\n5. NEVER let an unhandled exception reach an API response. Every function that performs I/O must use structured error handling and throw typed ApiError instances. The route handler maps these to the standard { \"error\": \"<code>\", \"message\": \"...\" } JSON shape.\n\n6. NEVER make outbound HTTP requests without a 10-second AbortController timeout. Cap response body reads at 10 MB.\n\n7. NEVER allow outbound requests to any host other than api.github.com or raw.githubusercontent.com. Assert the constructed URL's hostname against the allowed set before calling fetch.\n\n8. Every public function must have explicit type annotations on all parameters and the return type, plus a docstring covering Summary, Args, Returns, Raises, and Side effects (omit sections that do not apply).\n\nWhen running shell commands, only use: npm, npx, node, git. Do not run rm -rf, sudo, curl, wget, chmod, chown, kill, pkill, or any command that deletes files in bulk, modifies permissions, or contacts external services outside the GitHub MCP server.\n\nWhen in doubt about a design decision, re-read design.md rather than inventing a new pattern.",
+
+  "tools": ["read", "write", "shell", "@mcp"],
+
+  "allowedTools": [
+    "read_file",
+    "read_code",
+    "grep_search",
+    "file_search",
+    "list_directory",
+    "str_replace",
+    "fs_write",
+    "fs_append"
+  ],
+
+  "permissions": {
+    "rules": [
+      { "capability": "shell", "match": ["npm *"],  "effect": "allow" },
+      { "capability": "shell", "match": ["npx *"],  "effect": "allow" },
+      { "capability": "shell", "match": ["node *"], "effect": "allow" },
+      { "capability": "shell", "match": ["git status", "git diff *", "git log *", "git add *", "git commit *", "git checkout *", "git branch *", "git stash *"], "effect": "allow" },
+      { "capability": "shell", "match": ["rm *"],       "effect": "deny" },
+      { "capability": "shell", "match": ["rm -rf *"],   "effect": "deny" },
+      { "capability": "shell", "match": ["sudo *"],     "effect": "deny" },
+      { "capability": "shell", "match": ["curl *"],     "effect": "deny" },
+      { "capability": "shell", "match": ["wget *"],     "effect": "deny" },
+      { "capability": "shell", "match": ["chmod *"],    "effect": "deny" },
+      { "capability": "shell", "match": ["chown *"],    "effect": "deny" },
+      { "capability": "shell", "match": ["kill *"],     "effect": "deny" },
+      { "capability": "shell", "match": ["pkill *"],    "effect": "deny" },
+      { "capability": "shell", "match": ["git push *"], "effect": "ask"  },
+      { "capability": "shell", "match": ["git reset *"], "effect": "ask" },
+      { "capability": "shell", "match": ["git clean *"], "effect": "deny" },
+      { "capability": "fs_read",  "match": ["**"], "effect": "allow" },
+      { "capability": "fs_write", "match": ["src/**"],   "effect": "allow" },
+      { "capability": "fs_write", "match": ["tests/**"], "effect": "allow" },
+      { "capability": "fs_write", "match": [".kiro/**"], "effect": "ask"  },
+      { "capability": "fs_write", "match": ["package.json"],     "effect": "ask" },
+      { "capability": "fs_write", "match": ["tsconfig*.json"],   "effect": "ask" },
+      { "capability": "fs_write", "match": [".env*"],            "effect": "deny" }
+    ]
+  },
+
+  "resources": [
+    "file://../specs/repo-visualizer/requirements.md",
+    "file://../specs/repo-visualizer/design.md",
+    "file://../steering/code-style.md",
+    "file://../steering/api-error-handling.md",
+    "file://../steering/input-security.md",
+    "file://../steering/output-constants.md"
+  ],
+
+  "includeMcpJson": true,
+
+  "welcomeMessage": "repo-visualizer-dev ready.\n\nLoaded context: requirements.md · design.md · code-style · api-error-handling · input-security · output-constants\n\nI will stay within the component boundaries in design.md and import all spec constants from src/config/output.ts. What would you like to implement?"
+}

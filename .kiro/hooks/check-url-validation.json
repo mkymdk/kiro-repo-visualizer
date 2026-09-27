@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Check URL Validation & Timeout on Save",
+      "trigger": "PostFileSave",
+      "description": "Warn when a file that fetches GitHub URLs is missing the allowlist regex or 10-second timeout guard.",
+      "matcher": "(github|repo|fetch|analyzer|analysis|extract|client|api)\\.(ts|tsx|js|jsx|py)$",
+      "action": {
+        "type": "command",
+        "command": "\nFILE=$(echo \"$KIRO_HOOK_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('file',''))\" 2>/dev/null)\nif [ -z \"$FILE\" ]; then exit 0; fi\n\necho \"=== Security check: URL validation & timeout in $FILE ===\"\n\nWARNINGS=\"\"\n\n# 1. URL allowlist pattern check\n# Must contain the github.com regex anchored to owner/repo shape\nif ! grep -qP 'github\\\\.com.*[a-zA-Z0-9_\\-]\\{1,100\\}.*[a-zA-Z0-9_\\-]\\{1,100\\}|github\\\\.com/\\[a-zA-Z0-9' \"$FILE\"; then\n  WARNINGS=\"$WARNINGS\\n  ⚠ No GitHub URL allowlist regex found. All user-submitted URLs must be validated against:\\n    ^https://github\\\\.com/[a-zA-Z0-9_-]{1,100}/[a-zA-Z0-9_-]{1,100}\\$\"\nfi\n\n# 2. Timeout enforcement check\n# Look for AbortController + setTimeout (JS/TS), or timeout= param (Python requests/httpx), or context with deadline (Go)\nHAS_TIMEOUT=false\ngrep -qP 'AbortController|setTimeout.*abort|signal.*abort|\\.timeout\\s*=|timeout\\s*[:=]\\s*10|10[_,]?000|10000' \"$FILE\" && HAS_TIMEOUT=true\n\nif [ \"$HAS_TIMEOUT\" = false ]; then\n  WARNINGS=\"$WARNINGS\\n  ⚠ No 10-second timeout found. Every outbound HTTP request must enforce a 10s timeout:\\n    - JS/TS: AbortController + setTimeout(() => controller.abort(), 10_000)\\n    - Python: requests.get(..., timeout=10) or httpx.get(..., timeout=10.0)\"\nfi\n\n# 3. Check that raw user input is not forwarded directly into fetch/requests\n# Flag if we see fetch(`...${...}`) or requests.get(url) without prior validation call nearby\nif grep -qP \"fetch\\(\\`[^\\`]*\\\\\\$\\{|requests\\.(get|post)\\(url\\b|axios\\.(get|post)\\(url\\b\" \"$FILE\"; then\n  WARNINGS=\"$WARNINGS\\n  ⚠ Possible raw URL interpolation into HTTP client detected.\\n    Extract and validate 'owner' and 'repo' tokens first; never forward the raw user string.\"\nfi\n\nif [ -n \"$WARNINGS\" ]; then\n  echo \"\"\n  echo \"⚠️  Security warnings in $FILE:\"\n  printf \"$WARNINGS\\n\"\n  echo \"\"\n  echo \"See .kiro/steering/input-security.md for full rules.\"\n  echo \"(This is a warning, not a hard block — review and address before merging.)\"\n  # exit 0 so save is not blocked, but output is surfaced\n  exit 0\nfi\n\necho \"✅ URL validation and timeout checks passed.\"\n",
+        "timeout": 10
+      }
+    }
+  ]
+}
