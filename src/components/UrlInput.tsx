@@ -17,19 +17,29 @@ interface UrlInputProps {
 const GITHUB_URL_RE =
   /^https:\/\/github\.com\/[a-zA-Z0-9_-]{1,100}\/[a-zA-Z0-9_-]{1,100}$/;
 
+// Static fallback messages. Note: `rate_limit_exceeded` is intentionally
+// omitted here — the server computes an accurate wait time and sends it in
+// the response `message`, which the client prefers for that code.
 const ERROR_MESSAGES: Partial<Record<ApiErrorCode, string>> = {
   invalid_url:
     "Please enter a valid GitHub repository URL (https://github.com/owner/repo).",
   repo_not_found:
     "Repository not found or not publicly accessible. Please check the URL.",
-  rate_limit_exceeded:
-    "GitHub API rate limit reached. Please retry after 60 seconds.",
   request_timeout:
     "The request timed out. Please check your connection and try again.",
   network_error:
     "A network error occurred. Please check your connection and try again.",
   internal_error: "An unexpected server error occurred. Please try again.",
 };
+
+/** Codes for which the server-provided message is preferred over static text. */
+const SERVER_MESSAGE_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
+  "rate_limit_exceeded",
+]);
+
+/** Generic fallback used only when the server sends no message for a code. */
+const GENERIC_RATE_LIMIT_MESSAGE =
+  "GitHub API rate limit reached. Please try again later.";
 
 // ---------------------------------------------------------------------------
 // Component
@@ -77,10 +87,16 @@ export function UrlInput({ onSuccess }: UrlInputProps): React.ReactElement {
       if (!response.ok) {
         const errorData = data as { error?: ApiErrorCode; message?: string };
         const code = errorData.error;
-        const msg =
-          (code && ERROR_MESSAGES[code]) ??
-          errorData.message ??
-          "An unexpected error occurred.";
+        let msg: string;
+        if (code && SERVER_MESSAGE_CODES.has(code)) {
+          // Prefer the server's dynamic message (accurate rate-limit wait).
+          msg = errorData.message ?? GENERIC_RATE_LIMIT_MESSAGE;
+        } else {
+          msg =
+            (code && ERROR_MESSAGES[code]) ??
+            errorData.message ??
+            "An unexpected error occurred.";
+        }
         setError(msg);
         inputRef.current?.focus();
         return;
