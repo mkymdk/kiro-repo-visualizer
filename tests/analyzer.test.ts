@@ -14,6 +14,8 @@ import {
   fetchCommits,
   fetchSpecDocs,
   analyzeRepository,
+  computeRateLimitWaitSeconds,
+  formatRateLimitMessage,
 } from "../src/server/analyzer.js";
 import { ApiError } from "../src/types/index.js";
 
@@ -437,5 +439,121 @@ describe("analyzeRepository", () => {
     expect(result.commits).toHaveLength(1);
     expect(result.specDocs).toEqual([]);
     expect(result.partialFailures).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeRateLimitWaitSeconds
+// ---------------------------------------------------------------------------
+
+describe("computeRateLimitWaitSeconds", () => {
+  it("prefers Retry-After (delta seconds) when present", () => {
+    const res = mockResponse("", 429, { "Retry-After": "42" });
+    expect(computeRateLimitWaitSeconds(res, 1_000_000)).toBe(42);
+  });
+
+  it("rounds Retry-After up to whole seconds", () => {
+    const res = mockResponse("", 429, { "Retry-After": "10.2" });
+    expect(computeRateLimitWaitSeconds(res, 1_000_000)).toBe(11);
+  });
+
+  it("falls back to X-RateLimit-Reset when Retry-After is absent", () => {
+    // now = 1000s; reset = 1600s → wait 600s
+    const nowMs = 1000 * 1000;
+    const res = mockResponse("", 403, {
+      "X-RateLimit-Remaining": "0",
+      "X-RateLimit-Reset": "1600",
+    });
+    expect(computeRateLimitWaitSeconds(res, nowMs)).toBe(600);
+  });
+
+  it("prefers Retry-After over X-RateLimit-Reset when both present", () => {
+    const res = mockResponse("", 429, {
+      "Retry-After": "30",
+      "X-RateLimit-Reset": "9999999999",
+    });
+    expect(computeRateLimitWaitSeconds(res, 0)).toBe(30);
+  });
+
+  it("returns null when neither header is present", () => {
+    const res = mockResponse("", 429, {});
+    expect(computeRateLimitWaitSeconds(res, 0)).toBeNull();
+  });
+
+  it("returns null when X-RateLimit-Reset is in the past", () => {
+    const nowMs = 2000 * 1000; // now = 2000s
+    const res = mockResponse("", 403, {
+      "X-RateLimit-Remaining": "0",
+      "X-RateLimit-Reset": "1000", // already passed
+    });
+    expect(computeRateLimitWaitSeconds(res, nowMs)).toBeNull();
+  });
+
+  it("ignores non-numeric header values", () => {
+    const res = mockResponse("", 429, { "Retry-After": "soon" });
+    expect(computeRateLimitWaitSeconds(res, 0)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatRateLimitMessage
+// ---------------------------------------------------------------------------
+
+describe("formatRateLimitMessage", () => {
+  it("formats a short wait in seconds", () => {
+    expect(formatRateLimitMessage(42)).toContain("42 seconds");
+  });
+
+  it("uses singular 'second' for a 1-second wait", () => {
+    expect(formatRateLimitMessage(1)).toContain("1 second.");
+  });
+
+  it("formats a long wait in minutes", () => {
+    // 600s → 10 minutes
+    expect(formatRateLimitMessage(600)).toContain("10 minutes");
+  });
+
+  it("rounds minutes up", () => {
+    // 2520s = 42 minutes exactly
+    expect(formatRateLimitMessage(2520)).toContain("42 minutes");
+    // 130s → ceil(130/60) = 3 minutes
+    expect(formatRateLimitMessage(130)).toContain("3 minutes");
+  });
+
+  it("falls back to a generic message when wait is null", () => {
+    const msg = formatRateLimitMessage(null);
+    expect(msg).toContain("try again later");
+    expect(msg).not.toMatch(/\d+\s*(second|minute)/);
+  });
+
+  it("never promises a specific number in the null fallback", () => {
+    expect(formatRateLimitMessage(null)).not.toMatch(/\d/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// throwIfRateLimited integration — message reflects headers
+// ---------------------------------------------------------------------------
+
+describe("rate-limit message reflects response headers", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("fetchDirectoryTree surfaces a minutes-based message from X-RateLimit-Reset", async () => {
+    const futureReset = Math.floor(Date.now() / 1000) + 600; // ~10 min out
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        mockResponse("Forbidden", 403, {
+          "X-RateLimit-Remaining": "0",
+          "X-RateLimit-Reset": String(futureReset),
+        }),
+      ),
+    );
+    await expect(fetchDirectoryTree("o", "r")).rejects.toThrow(
+      expect.objectContaining({
+        code: "rate_limit_exceeded",
+        message: expect.stringContaining("minute"),
+      }),
+    );
   });
 });

@@ -48,7 +48,7 @@ The GitHub Repository Visualizer is a web-based tool that transforms a public Gi
 2. WHEN the repository contains a `README.md` file, THE Repository_Analyzer SHALL extract the full text content of the root-level `README.md`, up to a maximum of 1 MB, in preference to any nested `README.md` files.
 3. WHEN the repository contains a `.kiro` directory, THE Repository_Analyzer SHALL extract all files within that directory as Spec_Documentation, skipping any individual file whose size exceeds 1 MB.
 4. WHEN repository analysis is initiated, THE Repository_Analyzer SHALL extract the 50 most recent commits from the default branch of the repository, including each commit's author name, timestamp, and message.
-5. IF the GitHub API returns a rate-limit error during data extraction, THEN THE Repository_Analyzer SHALL display an error message indicating the rate limit has been reached and advise the User to retry after 60 seconds.
+5. IF the GitHub API returns a rate-limit error during data extraction, THEN THE Repository_Analyzer SHALL display an error message indicating the rate limit has been reached and advise the User of the actual time to wait before retrying, derived from the GitHub `Retry-After` or `X-RateLimit-Reset` response headers; WHEN neither header is available, THE Repository_Analyzer SHALL advise the User to try again later without promising a specific duration.
 6. IF any individual data extraction step fails for a reason other than rate-limiting, THEN THE Repository_Analyzer SHALL skip the failing step, continue extracting remaining data, and notify the User that partial data was retrieved.
 
 ---

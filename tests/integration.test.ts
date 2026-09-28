@@ -13,9 +13,18 @@ import express, { Express } from "express";
 // Module mocks — must be declared before any imports that use them
 // ---------------------------------------------------------------------------
 
-vi.mock("../src/server/analyzer.js", () => ({
-  analyzeRepository: vi.fn(),
-}));
+vi.mock("../src/server/analyzer.js", async () => {
+  // Keep the real validateAndExtractTokens (and its real ApiError instance)
+  // so that thrown errors are recognized by the route error handler; mock
+  // only the network-calling analyzeRepository.
+  const actual = await vi.importActual<typeof import("../src/server/analyzer.js")>(
+    "../src/server/analyzer.js",
+  );
+  return {
+    ...actual,
+    analyzeRepository: vi.fn(),
+  };
+});
 
 vi.mock("../src/server/renderer.js", () => {
   const jobs = new Map();
@@ -36,6 +45,7 @@ vi.mock("../src/server/renderer.js", () => {
 import { analyzeRepository } from "../src/server/analyzer.js";
 import { videoRenderer } from "../src/server/renderer.js";
 import { router, apiErrorHandler } from "../src/server/routes.js";
+import { analysisCache } from "../src/server/cache.js";
 import { ApiError, RepoAnalysisResult, Slide } from "../src/types/index.js";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +59,13 @@ function buildApp(): Express {
   app.use(apiErrorHandler);
   return app;
 }
+
+// The analysis cache is a real module-level singleton shared across the
+// route handlers. Clear it before every test to prevent cross-test cache
+// hits from masking mocked analyzer behavior.
+beforeEach(() => {
+  analysisCache.clear();
+});
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -212,9 +229,20 @@ describe("GET /api/storyboard", () => {
     expect(res.status).toBe(400);
   });
 
-  it("returns 404 when no cached analysis exists for the URL", async () => {
-    const res = await request(app).get("/api/storyboard?url=https://github.com/unknown/repo");
-    expect(res.status).toBe(404);
+  it("re-analyzes on a cache miss instead of returning 404", async () => {
+    // New behavior (Option A): storyboard re-runs analysis when the cache is
+    // empty rather than dead-ending with a 404.
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...VALID_RESULT,
+      owner: "unknown",
+      repo: "repo",
+    });
+    const res = await request(app).get(
+      "/api/storyboard?url=https://github.com/unknown/repo",
+    );
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(1);
   });
 
   it("returns Slide[] after a successful analyze + storyboard flow", async () => {
@@ -463,5 +491,127 @@ describe("GET /api/download/:jobId", () => {
 
     const res = await request(app).get(`/api/download/${jobId}`);
     expect(res.headers["x-file-size-warning"]).toBe("true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Analysis cache behavior (Option A) at the route level
+// ---------------------------------------------------------------------------
+
+describe("POST /api/analyze — TTL cache", () => {
+  let app: Express;
+  const URL = "https://github.com/CacheOwner/CacheRepo";
+
+  beforeEach(() => {
+    app = buildApp();
+    vi.mocked(analyzeRepository).mockReset();
+    analysisCache.clear();
+  });
+
+  it("second identical request is served from cache (no second GitHub call)", async () => {
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...VALID_RESULT,
+      owner: "CacheOwner",
+      repo: "CacheRepo",
+    });
+
+    const r1 = await request(app).post("/api/analyze").send({ url: URL });
+    const r2 = await request(app).post("/api/analyze").send({ url: URL });
+
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    // analyzeRepository must have run exactly once — the 2nd was a cache hit.
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(1);
+  });
+
+  it("cache key is case-insensitive on owner/repo", async () => {
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...VALID_RESULT,
+      owner: "CacheOwner",
+      repo: "CacheRepo",
+    });
+
+    await request(app).post("/api/analyze").send({ url: URL });
+    // Different casing → same normalized key → cache hit
+    await request(app)
+      .post("/api/analyze")
+      .send({ url: "https://github.com/cacheowner/cacherepo" });
+
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT cache partial results (re-analyzes on next request)", async () => {
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...VALID_RESULT,
+      owner: "CacheOwner",
+      repo: "CacheRepo",
+      partialFailures: ["commits"],
+    });
+
+    await request(app).post("/api/analyze").send({ url: URL });
+    await request(app).post("/api/analyze").send({ url: URL });
+
+    // Partial results are never cached → analyzer runs both times.
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT cache error results", async () => {
+    vi.mocked(analyzeRepository).mockRejectedValue(
+      new ApiError("repo_not_found", "nope"),
+    );
+
+    await request(app).post("/api/analyze").send({ url: URL });
+    await request(app).post("/api/analyze").send({ url: URL });
+
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("GET /api/storyboard — cache integration", () => {
+  let app: Express;
+  const URL = "https://github.com/SbOwner/SbRepo";
+  const ENCODED = encodeURIComponent(URL);
+
+  beforeEach(() => {
+    app = buildApp();
+    vi.mocked(analyzeRepository).mockReset();
+    analysisCache.clear();
+  });
+
+  it("uses the cached analysis populated by /api/analyze (no extra call)", async () => {
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...VALID_RESULT,
+      owner: "SbOwner",
+      repo: "SbRepo",
+    });
+
+    await request(app).post("/api/analyze").send({ url: URL });
+    const res = await request(app).get(`/api/storyboard?url=${ENCODED}`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    // analyze called once; storyboard reused the cache.
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-analyzes when no cached entry exists (e.g. after expiry)", async () => {
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...VALID_RESULT,
+      owner: "SbOwner",
+      repo: "SbRepo",
+    });
+
+    // No prior /api/analyze → storyboard must analyze on demand.
+    const res = await request(app).get(`/api/storyboard?url=${ENCODED}`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 400 for an invalid URL", async () => {
+    const res = await request(app).get("/api/storyboard?url=not-a-url");
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("invalid_url");
   });
 });

@@ -188,11 +188,71 @@ async function readCappedBody(
 }
 
 /**
+ * Compute how many seconds a client should wait before retrying, based on
+ * GitHub's rate-limit response headers.
+ *
+ * Prefers the `Retry-After` header (delta seconds) when present, otherwise
+ * falls back to `X-RateLimit-Reset` (an epoch-seconds timestamp) relative to
+ * the current time.
+ *
+ * @param response - The rate-limited response to inspect.
+ * @param nowMs - The current time in milliseconds since the epoch. Defaults
+ *   to `Date.now()`; injectable for deterministic testing.
+ * @returns The number of whole seconds to wait, or `null` if neither header
+ *   yields a usable positive value.
+ */
+export function computeRateLimitWaitSeconds(
+  response: Response,
+  nowMs: number = Date.now(),
+): number | null {
+  const retryAfter = response.headers.get("Retry-After");
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.ceil(seconds);
+    }
+  }
+
+  const reset = response.headers.get("X-RateLimit-Reset");
+  if (reset !== null) {
+    const resetEpoch = Number(reset);
+    if (Number.isFinite(resetEpoch) && resetEpoch > 0) {
+      const waitSeconds = Math.ceil(resetEpoch - nowMs / 1000);
+      if (waitSeconds > 0) {
+        return waitSeconds;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Format a human-readable rate-limit message from a computed wait time.
+ *
+ * @param waitSeconds - Whole seconds to wait, or `null` if unknown.
+ * @returns A user-facing message. When `waitSeconds` is null, the message
+ *   avoids promising a specific duration.
+ */
+export function formatRateLimitMessage(waitSeconds: number | null): string {
+  if (waitSeconds === null) {
+    return "GitHub API rate limit reached. Please try again later.";
+  }
+  if (waitSeconds < 90) {
+    return `GitHub API rate limit reached. Please retry in about ${waitSeconds} second${waitSeconds === 1 ? "" : "s"}.`;
+  }
+  const minutes = Math.ceil(waitSeconds / 60);
+  return `GitHub API rate limit reached. Please retry in about ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+}
+
+/**
  * Detect GitHub rate-limit responses and throw the appropriate ApiError.
  *
  * @param response - The response to inspect for rate-limit signals.
  * @throws {@link ApiError} With code `rate_limit_exceeded` if the response
- *   is HTTP 429 or carries `X-RateLimit-Remaining: 0`.
+ *   is HTTP 429 or carries `X-RateLimit-Remaining: 0`. The error message
+ *   reflects the real wait time derived from `Retry-After` /
+ *   `X-RateLimit-Reset` when available.
  */
 function throwIfRateLimited(response: Response): void {
   const remaining = response.headers.get("X-RateLimit-Remaining");
@@ -200,9 +260,10 @@ function throwIfRateLimited(response: Response): void {
     response.status === 429 ||
     (response.status === 403 && remaining === "0")
   ) {
+    const waitSeconds = computeRateLimitWaitSeconds(response);
     throw new ApiError(
       "rate_limit_exceeded",
-      "GitHub API rate limit reached. Please retry after 60 seconds.",
+      formatRateLimitMessage(waitSeconds),
     );
   }
 }

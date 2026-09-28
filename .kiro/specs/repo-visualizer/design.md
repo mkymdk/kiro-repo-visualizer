@@ -309,7 +309,7 @@ POST /api/analyze
      │
      ├─ invalid_url         → HTTP 400, inline error below input
      ├─ repo_not_found      → HTTP 404, inline error below input
-     ├─ rate_limit_exceeded → HTTP 429, banner: "retry after 60s"
+     ├─ rate_limit_exceeded → HTTP 429, banner: computed wait from headers
      ├─ request_timeout     → HTTP 504, inline error, retry prompt
      ├─ network_error       → HTTP 502, inline error, retry prompt
      └─ partial_data        → HTTP 200, warning banner, continue

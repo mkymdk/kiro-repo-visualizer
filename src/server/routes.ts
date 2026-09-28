@@ -10,10 +10,11 @@
 
 import { Router, Request, Response, NextFunction } from "express";
 import fs from "fs";
-import { analyzeRepository } from "./analyzer.js";
+import { analyzeRepository, validateAndExtractTokens } from "./analyzer.js";
 import { generateStoryboard } from "./storyboard.js";
 import { videoRenderer } from "./renderer.js";
-import { ApiError, ApiErrorCode, RepoAnalysisResult, Slide } from "../types/index.js";
+import { analysisCache, AnalysisCache } from "./cache.js";
+import { ApiError, ApiErrorCode, Slide } from "../types/index.js";
 
 // ---------------------------------------------------------------------------
 // Error code → HTTP status map
@@ -31,13 +32,6 @@ const HTTP_STATUS: Record<ApiErrorCode, number> = {
 };
 
 // ---------------------------------------------------------------------------
-// Module-level analysis cache (keyed by repo URL)
-// ---------------------------------------------------------------------------
-
-/** In-memory cache of analysis results, keyed by repository URL. */
-const analysisCache = new Map<string, RepoAnalysisResult>();
-
-// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -50,6 +44,11 @@ export const router = Router();
 /**
  * Validate a GitHub repository URL, run all extraction steps, cache the
  * result, and return it as JSON.
+ *
+ * Validates the URL server-side first (Property 1), then consults the TTL
+ * cache using the validated, lowercased `owner/repo` key — never the raw
+ * user-submitted URL. On a cache hit the result is returned without any
+ * GitHub call. Only clean results (empty `partialFailures`) are cached.
  *
  * @remarks
  * Responds with `partial_data` warning in the body when some extraction
@@ -68,17 +67,29 @@ router.post(
         return;
       }
 
-      const result = await analyzeRepository(url.trim());
-      analysisCache.set(url.trim(), result);
+      // Validate server-side and derive the cache key from tokens only.
+      const { owner, repo } = validateAndExtractTokens(url.trim());
+      const cacheKey = AnalysisCache.keyFor(owner, repo);
 
-      if (result.partialFailures.length > 0) {
+      // Cache hit within TTL: return without calling GitHub.
+      const cached = analysisCache.get(cacheKey);
+      if (cached) {
+        res.status(200).json(cached);
+        return;
+      }
+
+      const result = await analyzeRepository(url.trim());
+
+      // Only cache complete results — never partial or error results.
+      if (result.partialFailures.length === 0) {
+        analysisCache.set(cacheKey, result);
+        res.status(200).json(result);
+      } else {
         res.status(200).json({
           error: "partial_data",
           message: "Some data could not be retrieved. Results may be incomplete.",
           ...result,
         });
-      } else {
-        res.status(200).json(result);
       }
     } catch (err: unknown) {
       next(err);
@@ -91,14 +102,20 @@ router.post(
 // ---------------------------------------------------------------------------
 
 /**
- * Look up the cached analysis result for a URL and generate a storyboard.
+ * Generate a storyboard for a repository URL.
+ *
+ * Validates the URL and derives the same `owner/repo` cache key used by
+ * `/api/analyze`. On a cache hit the cached analysis is used directly. If the
+ * entry has expired or was never present, the analysis is re-run so the flow
+ * does not dead-end after the TTL window.
  *
  * @remarks
- * Requires the `url` query parameter matching a previously analysed URL.
+ * Requires the `url` query parameter. May make GitHub API calls when the
+ * cached analysis is absent or expired.
  */
 router.get(
   "/storyboard",
-  (req: Request, res: Response, next: NextFunction): void => {
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const { url } = req.query as { url?: string };
       if (!url) {
@@ -109,16 +126,22 @@ router.get(
         return;
       }
 
-      const cached = analysisCache.get(url);
-      if (!cached) {
-        res.status(404).json({
-          error: "repo_not_found",
-          message: "No analysis found for this URL. Call POST /api/analyze first.",
-        });
-        return;
+      // Validate and derive the token-based key (never key on the raw URL).
+      const { owner, repo } = validateAndExtractTokens(url);
+      const cacheKey = AnalysisCache.keyFor(owner, repo);
+
+      // Use the cached analysis when available; otherwise re-analyze
+      // (handles TTL expiry gracefully). Only cache clean results.
+      let analysis = analysisCache.get(cacheKey);
+      if (!analysis) {
+        const fresh = await analyzeRepository(url);
+        if (fresh.partialFailures.length === 0) {
+          analysisCache.set(cacheKey, fresh);
+        }
+        analysis = fresh;
       }
 
-      const slides = generateStoryboard(cached);
+      const slides = generateStoryboard(analysis);
       res.status(200).json(slides);
     } catch (err: unknown) {
       next(err);
