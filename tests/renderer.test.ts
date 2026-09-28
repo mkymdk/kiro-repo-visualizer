@@ -110,6 +110,23 @@ describe("calculateSecondsPerSlide", () => {
       expect(Number.isInteger(sps)).toBe(true);
     }
   });
+
+  it("never returns 0 when slideCount exceeds maxDurationSeconds (zero-duration regression)", () => {
+    // Regression guard: for slideCount > maxDurationSeconds, Math.floor(maxSeconds / slideCount)
+    // is 0, which previously produced 0 seconds per slide -> a zero-frame render that ffmpeg
+    // rejects. The fix floors the result at 1. The render route accepts a caller-supplied slide
+    // array with no upper bound, so this path is reachable.
+    for (const count of [
+      VIDEO_CONFIG.maxDurationSeconds + 1,
+      VIDEO_CONFIG.maxDurationSeconds * 2,
+      1000,
+    ]) {
+      const sps = calculateSecondsPerSlide(count);
+      expect(sps).toBe(1);
+      expect(sps).toBeGreaterThan(0);
+      expect(Number.isInteger(sps)).toBe(true);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
