@@ -197,12 +197,26 @@ router.post(
         res.end();
       }
     } catch (err: unknown) {
-      if (!res.writableEnded) {
+      if (res.writableEnded) {
+        // Response already completed — nothing more can be sent, and handing
+        // the error to Express here would only trigger a spurious
+        // "headers already sent" warning. The error is already handled.
+        return;
+      }
+
+      if (res.headersSent) {
+        // SSE stream is open: report the failure over the stream and close it
+        // ourselves rather than delegating to the JSON error handler, which
+        // cannot set a status on an already-flushed response.
         const message =
           err instanceof Error ? err.message : "Render failed.";
         res.write(`data: ${JSON.stringify({ error: message })}\n\n`);
         res.end();
+        return;
       }
+
+      // Failure occurred before headers were flushed (e.g. during validation):
+      // let the top-level error handler produce a structured JSON response.
       next(err);
     }
   },
