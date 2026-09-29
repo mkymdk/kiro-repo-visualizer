@@ -230,8 +230,8 @@ export class VideoRenderer {
       const totalFrames = allFrames.length;
 
       await new Promise<void>((resolve, reject) => {
-        let frameIndex = 0;
-        let progressIntervalHandle: ReturnType<typeof setInterval> | null = null;
+        let encodedFrames = 0;
+        let lastProgressAt = 0;
 
         const command = Ffmpeg();
 
@@ -252,31 +252,58 @@ export class VideoRenderer {
             "-movflags", "+faststart",
           ])
           .output(outputPath)
-          .on("start", () => {
-            progressIntervalHandle = setInterval(() => {
+          .on("progress", (progress: { frames?: number }) => {
+            // ffmpeg reports the number of frames it has actually encoded so
+            // far. Use that for real progress rather than how fast we can push
+            // buffers into the input stream. Throttle to the configured
+            // interval so we don't spam SSE events.
+            if (typeof progress.frames === "number") {
+              encodedFrames = progress.frames;
+            }
+            const now = Date.now();
+            if (now - lastProgressAt >= VIDEO_CONFIG.progressIntervalMs) {
+              lastProgressAt = now;
               const percent = totalFrames > 0
-                ? Math.min(99, Math.round((frameIndex / totalFrames) * 100))
+                ? Math.min(99, Math.round((encodedFrames / totalFrames) * 100))
                 : 0;
               onProgress(percent);
-            }, VIDEO_CONFIG.progressIntervalMs);
+            }
           })
           .on("error", (err: Error) => {
-            if (progressIntervalHandle) clearInterval(progressIntervalHandle);
             reject(err);
           })
           .on("end", () => {
-            if (progressIntervalHandle) clearInterval(progressIntervalHandle);
             resolve();
           })
           .run();
 
-        // Push frames into the stream
+        // Push frames into the stream while respecting backpressure. Writing
+        // hundreds of full-resolution PNG buffers in a tight synchronous loop
+        // ignores the `false` returned by write() when the internal buffer is
+        // full, buffering every frame in memory at once and producing a
+        // truncated/corrupt MP4. Instead, pause on backpressure and resume on
+        // the stream's "drain" event so ffmpeg consumes at its own pace.
         (async () => {
-          for (const frame of allFrames) {
-            frameStream.write(frame);
-            frameIndex++;
+          try {
+            for (const frame of allFrames) {
+              const hasCapacity = frameStream.write(frame);
+              if (!hasCapacity) {
+                await new Promise<void>((resolveDrain) =>
+                  frameStream.once("drain", resolveDrain),
+                );
+              }
+            }
+            frameStream.end();
+          } catch (writeErr: unknown) {
+            frameStream.destroy(
+              writeErr instanceof Error ? writeErr : undefined,
+            );
+            reject(
+              writeErr instanceof Error
+                ? writeErr
+                : new Error("Failed to write frames to the encoder."),
+            );
           }
-          frameStream.end();
         })();
       });
 
