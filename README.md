@@ -101,11 +101,13 @@ kiro-repo-visualizer/
 │   ├── hooks/
 │   │   └── useRenderJob.ts        # React hook wrapping the SSE render stream
 │   └── App.tsx                    # Top-level step router
-├── tests/
-│   ├── analyzer.test.ts           # Unit tests for analyzer (35 tests)
+├── tests/                         # 154 tests across 6 files
+│   ├── config.test.ts             # Config immutability tests (3 tests)
+│   ├── cache.test.ts              # Analysis TTL cache tests (12 tests)
+│   ├── analyzer.test.ts           # Unit tests for analyzer (49 tests)
 │   ├── storyboard.test.ts         # Unit tests for storyboard (38 tests)
-│   ├── renderer.test.ts           # Unit tests for renderer (16 tests)
-│   └── integration.test.ts        # Supertest integration tests (28 tests)
+│   ├── renderer.test.ts           # Unit tests for renderer (17 tests)
+│   └── integration.test.ts        # Supertest integration tests (35 tests)
 └── package.json
 ```
 
