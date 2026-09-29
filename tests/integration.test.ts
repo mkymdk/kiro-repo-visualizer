@@ -355,6 +355,7 @@ describe("DELETE /api/render/:jobId", () => {
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: null,
     });
     vi.mocked(videoRenderer.abort).mockResolvedValue(undefined);
 
@@ -430,6 +431,7 @@ describe("GET /api/download/:jobId", () => {
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: null,
     });
     const res = await request(app).get(`/api/download/${jobId}`);
     expect(res.status).toBe(409);
@@ -444,6 +446,7 @@ describe("GET /api/download/:jobId", () => {
       fileSizeBytes: 1000,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: Date.now(),
     });
     const res = await request(app).get(`/api/download/${jobId}`);
     expect(res.status).toBe(404);
@@ -464,6 +467,7 @@ describe("GET /api/download/:jobId", () => {
       fileSizeBytes: 13,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: Date.now(),
     });
 
     const res = await request(app).get(`/api/download/${jobId}`);
@@ -487,10 +491,109 @@ describe("GET /api/download/:jobId", () => {
       fileSizeBytes: 300 * 1024 * 1024,
       errorMessage: null,
       sizeWarning: true,
+      completedAtMs: Date.now(),
     });
 
     const res = await request(app).get(`/api/download/${jobId}`);
     expect(res.headers["x-file-size-warning"]).toBe("true");
+  });
+
+  it("HEAD returns headers with no body and does not delete the file", async () => {
+    const jobId = "head-no-side-effect-job";
+    const { writeFileSync, existsSync } = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const outputPath = path.default.join(os.default.tmpdir(), `${jobId}.mp4`);
+    writeFileSync(outputPath, "head fake mp4 data");
+
+    videoRenderer.jobs.set(jobId, {
+      id: jobId,
+      status: "complete",
+      outputPath,
+      fileSizeBytes: 18,
+      errorMessage: null,
+      sizeWarning: false,
+      completedAtMs: Date.now(),
+    });
+
+    const head = await request(app).head(`/api/download/${jobId}`);
+    expect(head.status).toBe(200);
+    expect(head.headers["content-type"]).toContain("video/mp4");
+    expect(head.headers["content-length"]).toBe("18");
+    // No body on a HEAD response.
+    expect(head.text).toBeFalsy();
+    // The file must still be on disk — HEAD has no side effect.
+    expect(existsSync(outputPath)).toBe(true);
+
+    // cleanup
+    if (existsSync(outputPath)) (await import("fs")).unlinkSync(outputPath);
+  });
+
+  it("HEAD followed by GET both succeed (regression: HEAD must not delete the file)", async () => {
+    const jobId = "head-then-get-job";
+    const { writeFileSync, existsSync } = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const outputPath = path.default.join(os.default.tmpdir(), `${jobId}.mp4`);
+    const contents = "valid mp4 payload bytes";
+    writeFileSync(outputPath, contents);
+
+    videoRenderer.jobs.set(jobId, {
+      id: jobId,
+      status: "complete",
+      outputPath,
+      fileSizeBytes: contents.length,
+      errorMessage: null,
+      sizeWarning: false,
+      completedAtMs: Date.now(),
+    });
+
+    // Frontend does a HEAD size-check first...
+    const head = await request(app).head(`/api/download/${jobId}`);
+    expect(head.status).toBe(200);
+    expect(existsSync(outputPath)).toBe(true);
+
+    // ...then the real GET download must still work.
+    const get = await request(app).get(`/api/download/${jobId}`);
+    expect(get.status).toBe(200);
+    expect(get.headers["content-length"]).toBe(String(contents.length));
+    // File is NOT deleted by the download itself.
+    expect(existsSync(outputPath)).toBe(true);
+
+    // cleanup
+    if (existsSync(outputPath)) (await import("fs")).unlinkSync(outputPath);
+  });
+
+  it("repeated GETs within the retention window both succeed", async () => {
+    const jobId = "repeated-get-job";
+    const { writeFileSync, existsSync } = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const outputPath = path.default.join(os.default.tmpdir(), `${jobId}.mp4`);
+    const contents = "repeatable payload";
+    writeFileSync(outputPath, contents);
+
+    videoRenderer.jobs.set(jobId, {
+      id: jobId,
+      status: "complete",
+      outputPath,
+      fileSizeBytes: contents.length,
+      errorMessage: null,
+      sizeWarning: false,
+      completedAtMs: Date.now(),
+    });
+
+    const first = await request(app).get(`/api/download/${jobId}`);
+    expect(first.status).toBe(200);
+    expect(existsSync(outputPath)).toBe(true);
+
+    const second = await request(app).get(`/api/download/${jobId}`);
+    expect(second.status).toBe(200);
+    expect(second.headers["content-length"]).toBe(String(contents.length));
+    expect(existsSync(outputPath)).toBe(true);
+
+    // cleanup
+    if (existsSync(outputPath)) (await import("fs")).unlinkSync(outputPath);
   });
 });
 

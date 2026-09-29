@@ -126,6 +126,12 @@ export interface RenderJob {
   errorMessage: string | null;
   /** True when `fileSizeBytes` exceeds `VIDEO_CONFIG.maxFileSizeBytes`. */
   sizeWarning: boolean;
+  /**
+   * Epoch milliseconds at which the job reached `"complete"`, or null if it
+   * has not completed. Used by the renderer's periodic sweep to delete the
+   * output file once it is older than `VIDEO_CONFIG.outputFileTtlMs`.
+   */
+  completedAtMs: number | null;
 }
 
 // ---------------------------------------------------------------------------

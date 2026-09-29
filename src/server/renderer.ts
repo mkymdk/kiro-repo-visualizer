@@ -214,6 +214,7 @@ export class VideoRenderer {
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: null,
     };
     this.jobs.set(jobId, job);
 
@@ -312,6 +313,7 @@ export class VideoRenderer {
       job.fileSizeBytes = stat.size;
       job.sizeWarning = stat.size > VIDEO_CONFIG.maxFileSizeBytes;
       job.status = "complete";
+      job.completedAtMs = Date.now();
       onProgress(100);
     } catch (err: unknown) {
       job.status = "failed";
@@ -361,7 +363,88 @@ export class VideoRenderer {
       });
     }
   }
+
+  /**
+   * Delete output files for completed jobs whose retention TTL has elapsed.
+   *
+   * Mirrors the analysis cache's TTL approach: a completed job's MP4 is kept
+   * on disk for `VIDEO_CONFIG.outputFileTtlMs` after completion so that a
+   * HEAD size-check, the actual GET download, and any repeated downloads all
+   * succeed. Once the TTL elapses the file is removed and the job record is
+   * forgotten. This replaces the previous, buggy approach of deleting the
+   * file on the download response's `finish` event, which fired for HEAD
+   * requests and made the download single-use.
+   *
+   * @param nowMs - Current time in epoch milliseconds. Defaults to
+   *   `Date.now()`; injectable for deterministic testing.
+   * @returns The number of jobs swept (files deleted / records removed).
+   *
+   * @remarks
+   * Deletes files from `os.tmpdir()` and removes entries from the in-memory
+   * `jobs` map as a side effect. Best-effort: filesystem errors are swallowed
+   * so one bad entry cannot stall the sweep.
+   */
+  sweepExpiredOutputs(nowMs: number = Date.now()): number {
+    let swept = 0;
+    for (const [jobId, job] of this.jobs) {
+      if (job.status !== "complete" || job.completedAtMs === null) {
+        continue;
+      }
+      if (nowMs - job.completedAtMs < VIDEO_CONFIG.outputFileTtlMs) {
+        continue;
+      }
+      try {
+        if (job.outputPath && fs.existsSync(job.outputPath)) {
+          fs.unlinkSync(job.outputPath);
+        }
+      } catch {
+        // Best-effort cleanup — never let one entry stall the sweep.
+      }
+      this.jobs.delete(jobId);
+      swept++;
+    }
+    return swept;
+  }
 }
 
 /** Module-level singleton renderer instance used by the route handlers. */
 export const videoRenderer = new VideoRenderer();
+
+/** Handle for the periodic output-file sweep, if running. */
+let sweepIntervalHandle: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start the periodic sweep that deletes expired render output files.
+ *
+ * Idempotent: calling it while a sweep is already scheduled is a no-op. The
+ * interval is `unref`'d so it does not keep the Node process alive on its own.
+ *
+ * @returns void
+ *
+ * @remarks
+ * Schedules a recurring timer that invokes
+ * {@link VideoRenderer.sweepExpiredOutputs} on the module singleton every
+ * `VIDEO_CONFIG.outputFileSweepIntervalMs` milliseconds.
+ */
+export function startOutputSweep(): void {
+  if (sweepIntervalHandle !== null) {
+    return;
+  }
+  sweepIntervalHandle = setInterval(() => {
+    videoRenderer.sweepExpiredOutputs();
+  }, VIDEO_CONFIG.outputFileSweepIntervalMs);
+  // Do not hold the event loop open solely for the sweep timer.
+  sweepIntervalHandle.unref?.();
+}
+
+/**
+ * Stop the periodic output-file sweep if it is running.
+ *
+ * @returns void
+ */
+export function stopOutputSweep(): void {
+  if (sweepIntervalHandle !== null) {
+    clearInterval(sweepIntervalHandle);
+    sweepIntervalHandle = null;
+  }
+}

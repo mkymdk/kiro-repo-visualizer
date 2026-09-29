@@ -8,6 +8,7 @@
 import express from "express";
 import cors from "cors";
 import { router, apiErrorHandler } from "./routes.js";
+import { startOutputSweep } from "./renderer.js";
 
 const app = express();
 
@@ -24,5 +25,8 @@ const PORT = 3001;
 app.listen(PORT, () => {
   console.log(`[server] Listening on http://localhost:${PORT}`);
 });
+
+// Begin periodic cleanup of expired render output files.
+startOutputSweep();
 
 export default app;

@@ -29,6 +29,14 @@ export const VIDEO_CONFIG = Object.freeze({
   downloadReadyMs: 5_000,
   /** Maximum time in seconds to honour a cancellation request */
   cancelTimeoutSeconds: 3,
+  /**
+   * Milliseconds a completed render's output file is retained on disk before
+   * a periodic sweep deletes it. Downloads (including repeated downloads and
+   * a HEAD size-check followed by a GET) must succeed within this window.
+   */
+  outputFileTtlMs: 10 * 60 * 1000, // 10 minutes
+  /** Interval in milliseconds between output-file cleanup sweeps. */
+  outputFileSweepIntervalMs: 60 * 1000, // 1 minute
 } as const);
 
 export const SLIDE_CONFIG = Object.freeze({

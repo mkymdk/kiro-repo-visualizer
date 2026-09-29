@@ -247,71 +247,90 @@ router.delete(
 // ---------------------------------------------------------------------------
 
 /**
- * Stream the completed MP4 file to the client.
+ * Serve the completed MP4 file to the client.
  *
+ * Handles both HEAD and GET. HEAD returns the same headers (`Content-Type`,
+ * `Content-Disposition`, `Content-Length`, and `X-File-Size-Warning` when
+ * applicable) with no body; GET streams the file. Neither method deletes the
+ * file — cleanup is handled by the renderer's TTL sweep
+ * (`VIDEO_CONFIG.outputFileTtlMs`), so a HEAD size-check followed by a GET,
+ * and repeated GETs within the retention window, all succeed.
+ *
+ * @remarks
  * Sets `X-File-Size-Warning: true` when the file exceeds the configured
- * maximum. Deletes the temp file after the response stream closes.
+ * maximum. Reads the file from `os.tmpdir()` but performs no deletion.
  */
-router.get(
-  "/download/:jobId",
-  (req: Request, res: Response, next: NextFunction): void => {
-    try {
-      const { jobId } = req.params;
-      const job = videoRenderer.jobs.get(jobId ?? "");
+function handleDownload(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  try {
+    const { jobId } = req.params;
+    const job = videoRenderer.jobs.get(jobId ?? "");
 
-      if (!job) {
-        res.status(404).json({
-          error: "repo_not_found",
-          message: `Render job ${jobId} not found.`,
-        });
-        return;
-      }
-
-      if (job.status !== "complete" || !job.outputPath) {
-        res.status(409).json({
-          error: "internal_error",
-          message: "Render job is not yet complete.",
-        });
-        return;
-      }
-
-      if (!fs.existsSync(job.outputPath)) {
-        res.status(404).json({
-          error: "internal_error",
-          message: "Output file not found.",
-        });
-        return;
-      }
-
-      const stat = fs.statSync(job.outputPath);
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="repository-video.mp4"`,
-      );
-      res.setHeader("Content-Length", String(stat.size));
-      if (job.sizeWarning) {
-        res.setHeader("X-File-Size-Warning", "true");
-      }
-
-      const outputPath = job.outputPath;
-      const stream = fs.createReadStream(outputPath);
-      stream.pipe(res);
-
-      res.on("finish", () => {
-        try {
-          if (fs.existsSync(outputPath)) {
-            fs.unlinkSync(outputPath);
-          }
-        } catch {
-          // Best-effort cleanup
-        }
+    if (!job) {
+      res.status(404).json({
+        error: "repo_not_found",
+        message: `Render job ${jobId} not found.`,
       });
-    } catch (err: unknown) {
-      next(err);
+      return;
     }
-  },
-);
+
+    if (job.status !== "complete" || !job.outputPath) {
+      res.status(409).json({
+        error: "internal_error",
+        message: "Render job is not yet complete.",
+      });
+      return;
+    }
+
+    if (!fs.existsSync(job.outputPath)) {
+      res.status(404).json({
+        error: "internal_error",
+        message: "Output file not found.",
+      });
+      return;
+    }
+
+    const stat = fs.statSync(job.outputPath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="repository-video.mp4"`,
+    );
+    res.setHeader("Content-Length", String(stat.size));
+    if (job.sizeWarning) {
+      res.setHeader("X-File-Size-Warning", "true");
+    }
+
+    // HEAD: headers only, no body, no side effect.
+    if (req.method === "HEAD") {
+      res.status(200).end();
+      return;
+    }
+
+    // GET: stream the file. No deletion here — the renderer's TTL sweep owns
+    // cleanup, so repeated downloads within the retention window succeed.
+    const stream = fs.createReadStream(job.outputPath);
+    stream.on("error", (streamErr: Error) => {
+      if (!res.headersSent) {
+        next(streamErr);
+      } else {
+        res.destroy(streamErr);
+      }
+    });
+    stream.pipe(res);
+  } catch (err: unknown) {
+    next(err);
+  }
+}
+
+// Register the same handler for HEAD and GET. Express would route HEAD to a
+// GET handler automatically, but registering HEAD explicitly makes the
+// no-body/no-side-effect contract obvious and keeps the method check honest.
+router.head("/download/:jobId", handleDownload);
+router.get("/download/:jobId", handleDownload);
 
 // ---------------------------------------------------------------------------
 // Top-level error handler
