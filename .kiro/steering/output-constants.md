@@ -58,6 +58,10 @@ export const VIDEO_CONFIG = {
   downloadReadyMs: 5_000,
   /** Maximum time in seconds to honour a cancellation request */
   cancelTimeoutSeconds: 3,
+  /** Milliseconds a completed render's output file is retained before a sweep deletes it */
+  outputFileTtlMs: 10 * 60 * 1000, // 10 minutes
+  /** Interval in milliseconds between output-file cleanup sweeps */
+  outputFileSweepIntervalMs: 60 * 1000, // 1 minute
 } as const;
 
 export const SLIDE_CONFIG = {
@@ -165,6 +169,8 @@ The following values are **only** permitted to appear as literals inside `src/co
 | Progress update interval | `2000` ms |
 | Download ready deadline | `5000` ms |
 | Cancellation deadline | `3` seconds |
+| Output file retention TTL | `600000` ms (10 min) |
+| Output file sweep interval | `60000` ms (1 min) |
 | Minimum slide count | `3` |
 | Maximum slide count | `15` |
 | Slide preview word limit | `50` words |

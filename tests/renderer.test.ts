@@ -14,9 +14,11 @@ import {
   buildOutputPath,
   calculateSecondsPerSlide,
   VideoRenderer,
+  startOutputSweep,
+  stopOutputSweep,
 } from "../src/server/renderer.js";
 import { VIDEO_CONFIG } from "../src/config/output.js";
-import { ApiError } from "../src/types/index.js";
+import { ApiError, RenderJob } from "../src/types/index.js";
 
 // ---------------------------------------------------------------------------
 // sanitizeJobId
@@ -156,6 +158,7 @@ describe("VideoRenderer.abort", () => {
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: null,
     });
     await renderer.abort(jobId);
     expect(renderer.jobs.get(jobId)?.status).toBe("cancelled");
@@ -179,6 +182,7 @@ describe("VideoRenderer.abort", () => {
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: null,
     });
 
     await renderer.abort(jobId);
@@ -195,11 +199,133 @@ describe("VideoRenderer.abort", () => {
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
+      completedAtMs: null,
     });
 
     const start = Date.now();
     await renderer.abort(jobId);
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(VIDEO_CONFIG.cancelTimeoutSeconds * 1000 + 100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VideoRenderer.sweepExpiredOutputs — TTL-based output file cleanup
+// ---------------------------------------------------------------------------
+
+describe("VideoRenderer.sweepExpiredOutputs", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function completeJob(
+    renderer: VideoRenderer,
+    jobId: string,
+    outputPath: string,
+    completedAtMs: number,
+  ): void {
+    const job: RenderJob = {
+      id: jobId,
+      status: "complete",
+      outputPath,
+      fileSizeBytes: 100,
+      errorMessage: null,
+      sizeWarning: false,
+      completedAtMs,
+    };
+    renderer.jobs.set(jobId, job);
+  }
+
+  it("keeps the output file for a completed job still within the TTL", async () => {
+    const { writeFileSync, existsSync, unlinkSync } = await import("fs");
+    const renderer = new VideoRenderer();
+    const jobId = "sweep-within-ttl";
+    const outputPath = path.join(os.tmpdir(), `${jobId}.mp4`);
+    writeFileSync(outputPath, "data");
+    completeJob(renderer, jobId, outputPath, 1_000);
+
+    // now is just before the TTL boundary
+    const swept = renderer.sweepExpiredOutputs(1_000 + VIDEO_CONFIG.outputFileTtlMs - 1);
+    expect(swept).toBe(0);
+    expect(existsSync(outputPath)).toBe(true);
+    expect(renderer.jobs.has(jobId)).toBe(true);
+
+    unlinkSync(outputPath);
+  });
+
+  it("deletes the output file and forgets the job once older than the TTL", async () => {
+    const { writeFileSync, existsSync } = await import("fs");
+    const renderer = new VideoRenderer();
+    const jobId = "sweep-past-ttl";
+    const outputPath = path.join(os.tmpdir(), `${jobId}.mp4`);
+    writeFileSync(outputPath, "data");
+    completeJob(renderer, jobId, outputPath, 1_000);
+
+    // now is exactly at the TTL boundary (>= expires)
+    const swept = renderer.sweepExpiredOutputs(1_000 + VIDEO_CONFIG.outputFileTtlMs);
+    expect(swept).toBe(1);
+    expect(existsSync(outputPath)).toBe(false);
+    expect(renderer.jobs.has(jobId)).toBe(false);
+  });
+
+  it("does not sweep jobs that never completed", () => {
+    const renderer = new VideoRenderer();
+    renderer.jobs.set("still-rendering", {
+      id: "still-rendering",
+      status: "rendering",
+      outputPath: null,
+      fileSizeBytes: null,
+      errorMessage: null,
+      sizeWarning: false,
+      completedAtMs: null,
+    });
+    const swept = renderer.sweepExpiredOutputs(Date.now() + VIDEO_CONFIG.outputFileTtlMs * 10);
+    expect(swept).toBe(0);
+    expect(renderer.jobs.has("still-rendering")).toBe(true);
+  });
+
+  it("tolerates an already-missing output file (best-effort) and still forgets the job", () => {
+    const renderer = new VideoRenderer();
+    const jobId = "sweep-missing-file";
+    completeJob(renderer, jobId, path.join(os.tmpdir(), "does-not-exist-xyz.mp4"), 0);
+    const swept = renderer.sweepExpiredOutputs(VIDEO_CONFIG.outputFileTtlMs + 1);
+    expect(swept).toBe(1);
+    expect(renderer.jobs.has(jobId)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// startOutputSweep / stopOutputSweep — periodic sweep scheduling
+// ---------------------------------------------------------------------------
+
+describe("startOutputSweep / stopOutputSweep", () => {
+  afterEach(() => {
+    stopOutputSweep();
+    vi.useRealTimers();
+  });
+
+  it("schedules a recurring sweep on the singleton and is idempotent", () => {
+    vi.useFakeTimers();
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+
+    startOutputSweep();
+    startOutputSweep(); // second call must be a no-op
+
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+    expect(setIntervalSpy).toHaveBeenCalledWith(
+      expect.any(Function),
+      VIDEO_CONFIG.outputFileSweepIntervalMs,
+    );
+  });
+
+  it("stopOutputSweep clears the timer so a subsequent start re-schedules", () => {
+    vi.useFakeTimers();
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+
+    startOutputSweep();
+    stopOutputSweep();
+    startOutputSweep(); // allowed to schedule again after stop
+
+    expect(setIntervalSpy).toHaveBeenCalledTimes(2);
   });
 });
