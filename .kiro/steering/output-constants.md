@@ -71,14 +71,40 @@ export const SLIDE_CONFIG = {
   maxSlides: 15,
   /** Maximum words shown in each slide preview summary */
   previewMaxWords: 50,
-  /** Maximum words extracted from README for the introduction slide */
-  introMaxWords: 300,
+  /** Maximum words extracted from the README's first prose paragraph for the overview slide */
+  introMaxWords: 120,
   /** Maximum section headings listed on a spec documentation slide */
   specMaxHeadings: 5,
   /** Maximum sentences extracted per spec section on a spec documentation slide */
   specMaxSentences: 3,
   /** Maximum Engineering Highlights extracted from commit history */
   maxHighlights: 10,
+  /** Maximum steps/lines shown on the "how to run" slide */
+  runMaxSteps: 8,
+  /** Maximum words kept per step on the "how to run" slide */
+  runMaxWordsPerStep: 20,
+  /** Maximum Capabilities listed on the capabilities slide */
+  capabilitiesMaxItems: 6,
+  /** Maximum words kept per Capability */
+  capabilityMaxWords: 20,
+  /** Capabilities slide is omitted when more than this fraction of Capabilities match a Key_Feature */
+  capabilitiesMaxOverlapRatio: 0.5,
+  /** Maximum Key_Feature slides (individual + summary); a ceiling, not a target */
+  maxFeatureSlides: 5,
+  /** Maximum words kept per Key_Feature description */
+  featureMaxWords: 40,
+  /** Maximum evolution slides (timeline + notable changes + commit highlights); a ceiling, not a target */
+  maxEvolutionSlides: 4,
+  /** Maximum entries listed on the Evolution_Timeline slide */
+  maxEvolutionItems: 8,
+  /** Minimum eligible entries required before an Evolution_Timeline slide is generated */
+  minEvolutionItems: 2,
+  /** Maximum words kept for a PR / release / commit Change_Context */
+  changeContextMaxWords: 30,
+  /** Minimum length of a token that can act as an Anchor_Term for relevance matching */
+  relevanceMinTermLength: 4,
+  /** Maximum `feat:` commit highlights used when no Anchor_Terms exist; a ceiling within maxEvolutionSlides */
+  maxFallbackHighlights: 2,
 } as const;
 
 export type VideoConfig = typeof VIDEO_CONFIG;
@@ -108,10 +134,23 @@ SLIDE_CONFIG = {
     "min_slides": 3,
     "max_slides": 15,
     "preview_max_words": 50,
-    "intro_max_words": 300,
+    "intro_max_words": 120,
     "spec_max_headings": 5,
     "spec_max_sentences": 3,
     "max_highlights": 10,
+    "run_max_steps": 8,
+    "run_max_words_per_step": 20,
+    "capabilities_max_items": 6,
+    "capability_max_words": 20,
+    "capabilities_max_overlap_ratio": 0.5,
+    "max_feature_slides": 5,
+    "feature_max_words": 40,
+    "max_evolution_slides": 4,
+    "max_evolution_items": 8,
+    "min_evolution_items": 2,
+    "change_context_max_words": 30,
+    "relevance_min_term_length": 4,
+    "max_fallback_highlights": 2,
 }
 ```
 
@@ -174,10 +213,27 @@ The following values are **only** permitted to appear as literals inside `src/co
 | Minimum slide count | `3` |
 | Maximum slide count | `15` |
 | Slide preview word limit | `50` words |
-| Introduction slide word limit | `300` words |
+| Overview slide README paragraph word limit | `120` words |
 | Spec slide max headings | `5` |
 | Spec slide max sentences | `3` |
 | Max Engineering Highlights | `10` |
+| Run slide max steps | `8` |
+| Run slide max words per step | `20` |
+| Capabilities slide max items | `6` |
+| Capability max words | `20` |
+| Capabilities/Key_Feature max overlap ratio | `0.5` |
+| Max Key_Feature slides (ceiling) | `5` |
+| Key_Feature description max words | `40` |
+| Max evolution slides (ceiling) | `4` |
+| Evolution_Timeline max entries | `8` |
+| Evolution_Timeline min eligible entries | `2` |
+| Change_Context max words | `30` |
+| Anchor_Term min length | `4` |
+| Fallback `feat:` commit highlights when no Anchor_Terms (ceiling) | `2` |
+
+### 2.4 Slide Caps Are Ceilings
+
+`maxSlides`, `maxFeatureSlides`, and `maxEvolutionSlides` are upper bounds. Storyboard code must never add, split, or repeat content to reach them; a storyboard with fewer, higher-value slides is the expected outcome for most repositories.
 
 ### 2.3 Changing a Constant
 

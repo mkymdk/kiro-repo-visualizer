@@ -74,15 +74,25 @@ beforeEach(() => {
 const VALID_RESULT: RepoAnalysisResult = {
   owner: "testowner",
   repo: "testrepo",
+  metadata: null,
   directoryTree: [
     { path: "src", type: "tree" },
     { path: "README.md", type: "blob", size: 100 },
   ],
   readmeText: "# Hello\nThis is a test repository.",
   commits: [
-    { sha: "abc", author: "Alice", timestamp: "2024-01-01T00:00:00Z", message: "feat: add feature" },
+    {
+      sha: "abc",
+      author: "Alice",
+      timestamp: "2024-01-01T00:00:00Z",
+      subject: "feat: add feature",
+      body: "",
+      message: "feat: add feature",
+    },
   ],
   specDocs: [],
+  pullRequests: [],
+  releases: [],
   partialFailures: [],
 };
 
@@ -716,5 +726,86 @@ describe("GET /api/storyboard — cache integration", () => {
     const res = await request(app).get("/api/storyboard?url=not-a-url");
     expect(res.status).toBe(400);
     expect(res.body.error).toBe("invalid_url");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End-to-end flow per repository shape (analysis mocked at the analyzer boundary)
+// ---------------------------------------------------------------------------
+
+import { ALL_FIXTURES, kiroRepo } from "./fixtures/repos.js";
+
+describe("full flow per repository shape", () => {
+  let app: Express;
+
+  beforeEach(() => {
+    app = buildApp();
+    vi.mocked(analyzeRepository).mockReset();
+    vi.mocked(videoRenderer.start).mockReset();
+  });
+
+  it.each(Object.entries(ALL_FIXTURES))("%s: analyze → storyboard → render → download", async (_name, fixture) => {
+    const url = `https://github.com/${fixture.owner}/${fixture.repo}`;
+    vi.mocked(analyzeRepository).mockResolvedValue(fixture);
+
+    const analyze = await request(app).post("/api/analyze").send({ url });
+    expect(analyze.status).toBe(200);
+
+    const sb = await request(app).get("/api/storyboard").query({ url });
+    expect(sb.status).toBe(200);
+    const slides = sb.body as Slide[];
+    expect(slides[0]?.type).toBe("intro");
+    expect(slides[slides.length - 1]?.type).toBe("conclusion");
+    expect(vi.mocked(analyzeRepository)).toHaveBeenCalledTimes(1); // storyboard used the cache
+
+    const { writeFileSync, rmSync } = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const jobId = `flow-${fixture.repo}`;
+    const outputPath = path.default.join(os.default.tmpdir(), `${jobId}.mp4`);
+    vi.mocked(videoRenderer.start).mockImplementation(async (received: Slide[]) => {
+      expect(received).toEqual(slides);
+      writeFileSync(outputPath, "mp4");
+      const job = {
+        id: jobId, status: "complete" as const, outputPath, fileSizeBytes: 3,
+        errorMessage: null, sizeWarning: false, completedAtMs: Date.now(),
+      };
+      videoRenderer.jobs.set(jobId, job);
+      return job;
+    });
+
+    try {
+      const render = await request(app).post("/api/render").send({ slides });
+      expect(render.status).toBe(200);
+      expect(render.text).toContain(`"jobId":"${jobId}"`);
+
+      const download = await request(app).get(`/api/download/${jobId}`);
+      expect(download.status).toBe(200);
+      expect(download.headers["content-type"]).toContain("video/mp4");
+    } finally {
+      rmSync(outputPath, { force: true });
+      videoRenderer.jobs.delete(jobId);
+    }
+  });
+
+  it("PR-step failure: partial_data, storyboard still generates without PR-based slides", async () => {
+    const url = `https://github.com/${kiroRepo.owner}/${kiroRepo.repo}`;
+    vi.mocked(analyzeRepository).mockResolvedValue({
+      ...kiroRepo,
+      pullRequests: [],
+      partialFailures: ["pullRequests"],
+    });
+
+    const analyze = await request(app).post("/api/analyze").send({ url });
+    expect(analyze.status).toBe(200);
+    expect(analyze.body.error).toBe("partial_data");
+
+    const sb = await request(app).get("/api/storyboard").query({ url });
+    expect(sb.status).toBe(200);
+    const out = sb.body as Slide[];
+    // No PR deep dives; releases and commits take over as evolution evidence.
+    expect(out.filter((s) => s.type === "change").every((s) => s.title.startsWith("Release"))).toBe(true);
+    expect(out.some((s) => s.type === "highlight")).toBe(true);
+    expect(out.some((s) => s.type === "feature")).toBe(true);
   });
 });

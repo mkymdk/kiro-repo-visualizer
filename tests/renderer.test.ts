@@ -16,6 +16,11 @@ import {
   VideoRenderer,
   startOutputSweep,
   stopOutputSweep,
+  wrapText,
+  fitLines,
+  layoutSlide,
+  decodeHtmlEntities,
+  LAYOUT,
 } from "../src/server/renderer.js";
 import { VIDEO_CONFIG } from "../src/config/output.js";
 import { ApiError, RenderJob } from "../src/types/index.js";
@@ -327,5 +332,104 @@ describe("startOutputSweep / stopOutputSweep", () => {
     startOutputSweep(); // allowed to schedule again after stop
 
     expect(setIntervalSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Text layout — wrapText / fitLines / layoutSlide (Req 4.15, 4.16; Property 13)
+// ---------------------------------------------------------------------------
+
+/** Fake measure: every character is 10px wide. */
+const measure10 = (s: string): number => Array.from(s).length * 10;
+
+describe("wrapText", () => {
+  it("wraps at word boundaries so no line exceeds maxWidth", () => {
+    const lines = wrapText("the quick brown fox jumps over the lazy dog", 100, measure10);
+    expect(lines).toEqual(["the quick", "brown fox", "jumps over", "the lazy", "dog"]);
+    for (const l of lines) expect(measure10(l)).toBeLessThanOrEqual(100);
+  });
+
+  it("keeps a line that fits exactly", () => {
+    expect(wrapText("abcde fghi", 100, measure10)).toEqual(["abcde fghi"]);
+  });
+
+  it("preserves explicit line breaks and blank lines", () => {
+    expect(wrapText("one\n\ntwo", 100, measure10)).toEqual(["one", "", "two"]);
+  });
+
+  it("breaks a word by characters only when it alone is wider than maxWidth", () => {
+    const lines = wrapText("hi abcdefghijklmnop ok", 50, measure10);
+    expect(lines).toEqual(["hi", "abcde", "fghij", "klmno", "p ok"]);
+    for (const l of lines) expect(measure10(l)).toBeLessThanOrEqual(50);
+  });
+
+  it("keeps leading indentation on the first wrapped line", () => {
+    expect(wrapText("  npm run dev", 200, measure10)).toEqual(["  npm run dev"]);
+  });
+});
+
+describe("fitLines", () => {
+  it("returns all lines unchanged when they fit (no ellipsis)", () => {
+    expect(fitLines(["a", "b"], 2, 100, measure10)).toEqual(["a", "b"]);
+  });
+
+  it("ignores trailing blank lines when deciding whether content was dropped", () => {
+    expect(fitLines(["a", "b", "", ""], 2, 100, measure10)).toEqual(["a", "b"]);
+  });
+
+  it("truncates and ends the last kept line with an ellipsis that fits", () => {
+    const out = fitLines(["aaaaaaaaaa", "bbbbbbbbbb", "cc"], 2, 100, measure10);
+    expect(out).toHaveLength(2);
+    expect(out[1]!.endsWith("…")).toBe(true);
+    expect(measure10(out[1]!)).toBeLessThanOrEqual(100);
+  });
+
+  it("does not end on a blank line when truncating", () => {
+    const out = fitLines(["aaa", "", "ccc"], 2, 100, measure10);
+    expect(out).toEqual(["aaa…"]);
+  });
+});
+
+describe("layoutSlide", () => {
+  const maxWidth = VIDEO_CONFIG.width - 2 * LAYOUT.margin;
+  const slide = (title: string, body: string) => ({ id: "x", type: "intro" as const, title, body, previewSummary: "" });
+
+  it("keeps short content intact without ellipsis", () => {
+    const layout = layoutSlide(slide("Short", "line one\nline two"), measure10, measure10);
+    expect(layout.titleLines).toEqual(["Short"]);
+    expect(layout.bodyLines).toEqual(["line one", "line two"]);
+    expect(layout.bodyLines.join("")).not.toContain("…");
+  });
+
+  it("wraps a long title to at most titleMaxLines and moves the body down", () => {
+    const longTitle = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+    const one = layoutSlide(slide("T", "b"), measure10, measure10);
+    const long = layoutSlide(slide(longTitle, "b"), measure10, measure10);
+    expect(long.titleLines).toHaveLength(LAYOUT.titleMaxLines);
+    expect(long.titleLines[long.titleLines.length - 1]!.endsWith("…")).toBe(true);
+    expect(long.bodyTop).toBeGreaterThan(one.bodyTop);
+  });
+
+  it("never places a body line below the bottom margin and ellipsizes overflow", () => {
+    const body = Array.from({ length: 100 }, (_, i) => `row ${i}`).join("\n");
+    const layout = layoutSlide(slide("T", body), measure10, measure10);
+    const lastBaseline = layout.bodyTop + (layout.bodyLines.length - 1) * LAYOUT.bodyLineHeight;
+    expect(lastBaseline).toBeLessThanOrEqual(VIDEO_CONFIG.height - LAYOUT.margin);
+    expect(layout.bodyLines[layout.bodyLines.length - 1]!.endsWith("…")).toBe(true);
+    for (const l of [...layout.titleLines, ...layout.bodyLines]) {
+      expect(measure10(l)).toBeLessThanOrEqual(maxWidth);
+    }
+  });
+
+  it("decodes HTML entities before measuring and drawing", () => {
+    const layout = layoutSlide(slide("a &amp; b", "&lt;x&gt; &quot;q&quot; &#39;s&#39;"), measure10, measure10);
+    expect(layout.titleLines).toEqual(["a & b"]);
+    expect(layout.bodyLines).toEqual([`<x> "q" 's'`]);
+  });
+});
+
+describe("decodeHtmlEntities", () => {
+  it("decodes &amp; last so escaped entities are not double-decoded", () => {
+    expect(decodeHtmlEntities("&amp;lt;")).toBe("&lt;");
   });
 });

@@ -99,8 +99,254 @@ export function calculateSecondsPerSlide(slideCount: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Text layout
+// ---------------------------------------------------------------------------
+
+/**
+ * Slide layout values. Presentation details, not spec constants, so they live
+ * here rather than in `src/config/output.ts`. Pixel values are relative to
+ * the `VIDEO_CONFIG.width × VIDEO_CONFIG.height` canvas.
+ */
+export const LAYOUT = Object.freeze({
+  /** Horizontal and bottom margin. */
+  margin: 60,
+  /** Baseline of the first title line. */
+  titleTop: 80,
+  /** Title font. */
+  titleFont: "bold 36px sans-serif",
+  /** Distance between title baselines. */
+  titleLineHeight: 44,
+  /** Maximum title lines before ellipsis. */
+  titleMaxLines: 2,
+  /** Gap between the last title baseline and the divider. */
+  dividerGap: 20,
+  /** Gap between the divider and the first body baseline. */
+  bodyGap: 40,
+  /** Body font. */
+  bodyFont: "20px monospace",
+  /** Distance between body baselines. */
+  bodyLineHeight: 28,
+  /** Background colour. */
+  background: "#1e1e2e",
+  /** Text colour. */
+  foreground: "#cdd6f4",
+  /** Divider colour. */
+  accent: "#89b4fa",
+});
+
+/** Measures the rendered width of a string in pixels. */
+export type MeasureText = (text: string) => number;
+
+/** Ellipsis appended to truncated lines. */
+const ELLIPSIS = "…";
+
+/**
+ * Decode the HTML entities produced by the storyboard's escaping.
+ *
+ * @param text - HTML-escaped text.
+ * @returns Text with `&amp;`, `&lt;`, `&gt;`, `&quot;`, and `&#39;` decoded.
+ */
+export function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/**
+ * Break a single word into chunks that each fit within `maxWidth`.
+ *
+ * @param word - A word wider than `maxWidth`.
+ * @param maxWidth - Available width in pixels.
+ * @param measure - Width measurement function.
+ * @returns Chunks in order; each has at least one character.
+ */
+function breakWord(word: string, maxWidth: number, measure: MeasureText): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  for (const ch of Array.from(word)) {
+    if (current !== "" && measure(current + ch) > maxWidth) {
+      chunks.push(current);
+      current = ch;
+    } else {
+      current += ch;
+    }
+  }
+  if (current !== "") chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Wrap text at word boundaries so no line exceeds `maxWidth`.
+ *
+ * Explicit line breaks (including blank lines) are preserved. A word is split
+ * across lines only when it alone is wider than `maxWidth`. Leading
+ * indentation of each source line is kept on its first wrapped line.
+ *
+ * @param text - Plain text, possibly multi-line.
+ * @param maxWidth - Available width in pixels.
+ * @param measure - Width measurement function.
+ * @returns Wrapped lines.
+ */
+export function wrapText(text: string, maxWidth: number, measure: MeasureText): string[] {
+  const out: string[] = [];
+  for (const rawLine of text.split("\n")) {
+    const indent = /^\s*/.exec(rawLine)![0];
+    const words = rawLine.trim().split(/\s+/).filter((w) => w.length > 0);
+    if (words.length === 0) {
+      out.push("");
+      continue;
+    }
+    let current = indent;
+    for (const word of words) {
+      const candidate = current.trim() === "" ? current + word : `${current} ${word}`;
+      if (measure(candidate) <= maxWidth) {
+        current = candidate;
+        continue;
+      }
+      if (current.trim() !== "") {
+        out.push(current);
+        current = "";
+      }
+      if (measure(current + word) <= maxWidth) {
+        current += word;
+      } else {
+        const chunks = breakWord(word, maxWidth, measure);
+        out.push(...chunks.slice(0, -1));
+        current = chunks[chunks.length - 1] ?? "";
+      }
+    }
+    out.push(current);
+  }
+  return out;
+}
+
+/**
+ * Keep at most `maxLines` lines; when lines are dropped, end the last kept line
+ * with an ellipsis that fits within `maxWidth`.
+ *
+ * Trailing blank lines are removed before counting, so an ellipsis is added
+ * only when real content was dropped.
+ *
+ * @param lines - Wrapped lines.
+ * @param maxLines - Maximum lines that fit.
+ * @param maxWidth - Available width in pixels.
+ * @param measure - Width measurement function.
+ * @returns The lines to render.
+ */
+export function fitLines(
+  lines: string[],
+  maxLines: number,
+  maxWidth: number,
+  measure: MeasureText,
+): string[] {
+  const trimmed = [...lines];
+  while (trimmed.length > 0 && trimmed[trimmed.length - 1]!.trim() === "") trimmed.pop();
+  if (trimmed.length <= maxLines) return trimmed;
+  if (maxLines <= 0) return [];
+
+  const kept = trimmed.slice(0, maxLines);
+  // Avoid ending on a blank line: drop trailing blanks inside the kept window.
+  while (kept.length > 1 && kept[kept.length - 1]!.trim() === "") kept.pop();
+  let last = kept[kept.length - 1]!.replace(/\s+$/, "");
+  while (last.length > 0 && measure(last + ELLIPSIS) > maxWidth) {
+    last = Array.from(last).slice(0, -1).join("").replace(/\s+$/, "");
+  }
+  kept[kept.length - 1] = last + ELLIPSIS;
+  return kept;
+}
+
+/** Computed text layout for one slide. */
+export interface SlideLayout {
+  /** Title lines to draw. */
+  titleLines: string[];
+  /** Body lines to draw. */
+  bodyLines: string[];
+  /** Y of the divider line. */
+  dividerY: number;
+  /** Baseline of the first body line. */
+  bodyTop: number;
+}
+
+/**
+ * Lay out a slide's title and body within the canvas.
+ *
+ * @param slide - The slide (HTML-escaped fields).
+ * @param measureTitle - Width measurement in the title font.
+ * @param measureBody - Width measurement in the body font.
+ * @returns The {@link SlideLayout}.
+ */
+export function layoutSlide(
+  slide: Slide,
+  measureTitle: MeasureText,
+  measureBody: MeasureText,
+): SlideLayout {
+  const maxWidth = VIDEO_CONFIG.width - 2 * LAYOUT.margin;
+  const titleLines = fitLines(
+    wrapText(decodeHtmlEntities(slide.title), maxWidth, measureTitle),
+    LAYOUT.titleMaxLines,
+    maxWidth,
+    measureTitle,
+  );
+  const lastTitleBaseline = LAYOUT.titleTop + (Math.max(titleLines.length, 1) - 1) * LAYOUT.titleLineHeight;
+  const dividerY = lastTitleBaseline + LAYOUT.dividerGap;
+  const bodyTop = dividerY + LAYOUT.bodyGap;
+  const bottom = VIDEO_CONFIG.height - LAYOUT.margin;
+  const maxBodyLines = Math.max(0, Math.floor((bottom - bodyTop) / LAYOUT.bodyLineHeight) + 1);
+  const bodyLines = fitLines(
+    wrapText(decodeHtmlEntities(slide.body), maxWidth, measureBody),
+    maxBodyLines,
+    maxWidth,
+    measureBody,
+  );
+  return { titleLines, bodyLines, dividerY, bodyTop };
+}
+
+// ---------------------------------------------------------------------------
 // Frame rendering
 // ---------------------------------------------------------------------------
+
+/**
+ * Render one slide to a PNG image.
+ *
+ * @param slide - The slide to render.
+ * @returns A PNG `Buffer` of `VIDEO_CONFIG.width × VIDEO_CONFIG.height` pixels.
+ */
+export function renderSlideImage(slide: Slide): Buffer {
+  const canvas = createCanvas(VIDEO_CONFIG.width, VIDEO_CONFIG.height);
+  const ctx = canvas.getContext("2d");
+  const measureIn = (font: string): MeasureText => (s: string): number => {
+    ctx.font = font;
+    return ctx.measureText(s).width;
+  };
+  const layout = layoutSlide(slide, measureIn(LAYOUT.titleFont), measureIn(LAYOUT.bodyFont));
+
+  ctx.fillStyle = LAYOUT.background;
+  ctx.fillRect(0, 0, VIDEO_CONFIG.width, VIDEO_CONFIG.height);
+
+  ctx.fillStyle = LAYOUT.foreground;
+  ctx.font = LAYOUT.titleFont;
+  layout.titleLines.forEach((line, i) => {
+    ctx.fillText(line, LAYOUT.margin, LAYOUT.titleTop + i * LAYOUT.titleLineHeight);
+  });
+
+  ctx.strokeStyle = LAYOUT.accent;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(LAYOUT.margin, layout.dividerY);
+  ctx.lineTo(VIDEO_CONFIG.width - LAYOUT.margin, layout.dividerY);
+  ctx.stroke();
+
+  ctx.fillStyle = LAYOUT.foreground;
+  ctx.font = LAYOUT.bodyFont;
+  layout.bodyLines.forEach((line, i) => {
+    ctx.fillText(line, LAYOUT.margin, layout.bodyTop + i * LAYOUT.bodyLineHeight);
+  });
+
+  return canvas.toBuffer("image/png");
+}
 
 /**
  * Render all frames for a single slide onto a canvas and return PNG buffers.
@@ -116,51 +362,7 @@ export function renderSlideFrames(
   slide: Slide,
   secondsPerSlide: number,
 ): Buffer[] {
-  const canvas = createCanvas(VIDEO_CONFIG.width, VIDEO_CONFIG.height);
-  const ctx = canvas.getContext("2d");
-
-  // Background
-  ctx.fillStyle = "#1e1e2e";
-  ctx.fillRect(0, 0, VIDEO_CONFIG.width, VIDEO_CONFIG.height);
-
-  // Title
-  ctx.fillStyle = "#cdd6f4";
-  ctx.font = `bold 36px sans-serif`;
-  ctx.fillText(
-    slide.title.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'"),
-    60,
-    80,
-  );
-
-  // Divider
-  ctx.strokeStyle = "#89b4fa";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(60, 100);
-  ctx.lineTo(VIDEO_CONFIG.width - 60, 100);
-  ctx.stroke();
-
-  // Body text — word-wrap at ~100 chars per line
-  ctx.fillStyle = "#cdd6f4";
-  ctx.font = "20px monospace";
-  const plainBody = slide.body
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-
-  const lines = plainBody.split("\n");
-  let y = 140;
-  const lineHeight = 28;
-  for (const line of lines) {
-    if (y > VIDEO_CONFIG.height - 60) break;
-    ctx.fillText(line.slice(0, 100), 60, y);
-    y += lineHeight;
-  }
-
-  // Encode to PNG buffer once and replicate for each frame
-  const framePng = canvas.toBuffer("image/png");
+  const framePng = renderSlideImage(slide);
   const frameCount = secondsPerSlide * VIDEO_CONFIG.fps;
   return Array.from({ length: frameCount }, () => framePng);
 }
