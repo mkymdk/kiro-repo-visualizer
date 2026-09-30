@@ -211,6 +211,7 @@ export interface RenderJob {
  * All valid error codes that can be returned by the API.
  *
  * - `invalid_url`          — URL fails the GitHub allowlist regex
+ * - `invalid_input`        — a request parameter is malformed or out of range (e.g. Target_Duration)
  * - `repo_not_found`       — repository is inaccessible or does not exist
  * - `rate_limit_exceeded`  — GitHub API rate limit hit
  * - `request_timeout`      — individual outbound request exceeded 10 s
@@ -221,6 +222,7 @@ export interface RenderJob {
  */
 export type ApiErrorCode =
   | "invalid_url"
+  | "invalid_input"
   | "repo_not_found"
   | "rate_limit_exceeded"
   | "request_timeout"

@@ -134,6 +134,50 @@ describe("calculateSecondsPerSlide", () => {
       expect(Number.isInteger(sps)).toBe(true);
     }
   });
+
+  // --- explicit Target_Duration path ---
+
+  it("distributes an explicit in-range target across slides", () => {
+    const target = VIDEO_CONFIG.minDurationSeconds; // known in-range value
+    const count = 5;
+    const sps = calculateSecondsPerSlide(count, target);
+    expect(sps).toBe(Math.round(target / count));
+    // Total matches the target to within one second per slide of rounding.
+    expect(Math.abs(sps * count - target)).toBeLessThanOrEqual(count);
+  });
+
+  it("floors each slide at 1 second when the target is smaller than the slide count", () => {
+    // target < count would give < 1s per slide before the floor
+    const sps = calculateSecondsPerSlide(
+      VIDEO_CONFIG.minDurationSeconds + 10,
+      VIDEO_CONFIG.minDurationSeconds,
+    );
+    expect(sps).toBeGreaterThanOrEqual(1);
+    expect(Number.isInteger(sps)).toBe(true);
+  });
+
+  it("defensively clamps an out-of-range target into the allowed range", () => {
+    const count = 6;
+    const belowMin = calculateSecondsPerSlide(count, 1);
+    const aboveMax = calculateSecondsPerSlide(
+      count,
+      VIDEO_CONFIG.maxDurationSeconds + 1000,
+    );
+    expect(belowMin).toBe(
+      Math.max(1, Math.round(VIDEO_CONFIG.minDurationSeconds / count)),
+    );
+    expect(aboveMax).toBe(
+      Math.max(1, Math.round(VIDEO_CONFIG.maxDurationSeconds / count)),
+    );
+  });
+
+  it("uses the slide-count-derived default when no target is provided", () => {
+    // The default path is unchanged from the pre-feature behaviour.
+    const withoutTarget = calculateSecondsPerSlide(5);
+    const explicitUndefined = calculateSecondsPerSlide(5, undefined);
+    expect(withoutTarget).toBe(explicitUndefined);
+    expect(withoutTarget * 5).toBeLessThanOrEqual(VIDEO_CONFIG.maxDurationSeconds);
+  });
 });
 
 // ---------------------------------------------------------------------------

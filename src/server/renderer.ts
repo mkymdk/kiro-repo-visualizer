@@ -65,35 +65,52 @@ export function buildOutputPath(jobId: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Calculate the number of seconds to display each slide so the total video
- * duration stays within `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`.
+ * Calculate the number of seconds to display each slide.
+ *
+ * When `targetDurationSeconds` is supplied, the target is distributed evenly
+ * across the slides so the total video length matches the target to within one
+ * second per slide of rounding. When omitted, a default is derived from the
+ * slide count that keeps the total close to `VIDEO_CONFIG.minDurationSeconds`
+ * without exceeding `VIDEO_CONFIG.maxDurationSeconds`.
  *
  * @param slideCount - The number of slides to render.
- * @returns Seconds per slide — always at least 1. Chosen so the total
- *   duration is close to `minDurationSeconds` for small slide counts and does
- *   not exceed `maxDurationSeconds` until the count itself exceeds
- *   `maxDurationSeconds`.
+ * @param targetDurationSeconds - Optional caller-supplied target total
+ *   duration in seconds. Expected to already lie within
+ *   `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`; the
+ *   route validates and rejects out-of-range values before calling the
+ *   renderer. Any provided value is defensively clamped to that range here.
+ * @returns Seconds per slide — always at least 1.
  *
  * @remarks
- * The result is floored at 1 second. When `slideCount` exceeds
- * `maxDurationSeconds` the total video will necessarily run longer than
- * `maxDurationSeconds` (one second per slide is the minimum meaningful
- * display time); returning 0 here would produce a zero-frame render that
- * ffmpeg rejects. `generateStoryboard` caps storyboards at
+ * The result is floored at 1 second. When `slideCount` exceeds the target
+ * (or `maxDurationSeconds` on the default path) the total video will
+ * necessarily run longer than the target, because one second per slide is the
+ * minimum meaningful display time; returning 0 would produce a zero-frame
+ * render that ffmpeg rejects. `generateStoryboard` caps storyboards at
  * `SLIDE_CONFIG.maxSlides`, but the render route accepts a caller-supplied
  * slide array, so this floor guards the unbounded input path.
  */
-export function calculateSecondsPerSlide(slideCount: number): number {
-  if (slideCount <= 0) return VIDEO_CONFIG.minDurationSeconds;
+export function calculateSecondsPerSlide(
+  slideCount: number,
+  targetDurationSeconds?: number,
+): number {
+  if (slideCount <= 0) {
+    return targetDurationSeconds ?? VIDEO_CONFIG.minDurationSeconds;
+  }
 
-  const targetSeconds = VIDEO_CONFIG.minDurationSeconds;
   const maxSeconds = VIDEO_CONFIG.maxDurationSeconds;
 
-  // Try to spread evenly across minDuration first
-  const ideal = Math.ceil(targetSeconds / slideCount);
+  if (typeof targetDurationSeconds === "number") {
+    // Defensively clamp the caller-supplied target to the allowed range.
+    const clampedTarget = Math.min(
+      maxSeconds,
+      Math.max(VIDEO_CONFIG.minDurationSeconds, targetDurationSeconds),
+    );
+    return Math.max(1, Math.round(clampedTarget / slideCount));
+  }
 
-  // Clamp so total doesn't exceed maxDuration, but never drop below 1 second
-  // per slide (a 0 would yield a zero-frame render that ffmpeg rejects).
+  // Default path: spread evenly across minDuration, clamped by maxDuration.
+  const ideal = Math.ceil(VIDEO_CONFIG.minDurationSeconds / slideCount);
   const maxPerSlide = Math.floor(maxSeconds / slideCount);
   return Math.max(1, Math.min(ideal, maxPerSlide));
 }
@@ -394,6 +411,11 @@ export class VideoRenderer {
    * @param slides - The ordered array of {@link Slide} objects to render.
    * @param onProgress - Callback invoked with a percent value (0–100) as
    *   encoding proceeds.
+   * @param targetDurationSeconds - Optional target total video duration in
+   *   seconds, distributed across the slides. When omitted, a default is
+   *   derived from the slide count. Expected to be within
+   *   `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`
+   *   (validated by the route before this method is called).
    * @returns The completed {@link RenderJob} record.
    * @throws {@link ApiError} With code `internal_error` if rendering fails.
    *
@@ -405,6 +427,7 @@ export class VideoRenderer {
   async start(
     slides: Slide[],
     onProgress: ProgressCallback,
+    targetDurationSeconds?: number,
   ): Promise<RenderJob> {
     const jobId = randomUUID();
     const outputPath = buildOutputPath(jobId);
@@ -422,7 +445,10 @@ export class VideoRenderer {
 
     try {
       job.status = "rendering";
-      const secondsPerSlide = calculateSecondsPerSlide(slides.length);
+      const secondsPerSlide = calculateSecondsPerSlide(
+        slides.length,
+        targetDurationSeconds,
+      );
 
       // Render all frames
       const allFrames: Buffer[] = [];

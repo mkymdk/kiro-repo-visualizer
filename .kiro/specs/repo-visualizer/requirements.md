@@ -32,6 +32,7 @@ The GitHub Repository Visualizer is a web-based tool that transforms a public Gi
 - **Engineering_Highlight**: A commit from the Commit_History selected as fallback or supplementary evidence of a notable change, as defined in Requirement 7.9.
 - **Progress_Indicator**: A UI element that communicates the current rendering progress as a percentage value between 0 and 100.
 - **Run_Instructions**: Setup or usage steps extracted from the repository README, identified by a section heading matching (case-insensitive) one of "Installation", "Getting Started", "Setup", "Usage", or "Quick Start", including any fenced code block within that section.
+- **Target_Duration**: A User-selected desired total video length, in seconds, constrained to the inclusive range from the minimum video duration to the maximum video duration defined in the output configuration.
 
 ---
 
@@ -109,6 +110,11 @@ The GitHub Repository Visualizer is a web-based tool that transforms a public Gi
 7. IF the rendering process fails before completion, THEN THE System SHALL display an error message describing the failure, discard any partially generated Video_File, and offer the User the option to retry rendering.
 8. WHEN the User cancels rendering before completion, THE System SHALL stop the rendering process within 3 seconds and discard any partially generated Video_File.
 9. IF the User initiates video export with an empty Storyboard containing zero slides, THEN THE System SHALL display an error message indicating that at least one slide is required and prevent the rendering process from starting.
+10. BEFORE initiating video export, THE System SHALL allow the User to select a Target_Duration in seconds, constrained to the inclusive range from `VIDEO_CONFIG.minDurationSeconds` to `VIDEO_CONFIG.maxDurationSeconds`.
+11. WHEN the User has not selected a Target_Duration, THE System SHALL derive a default Target_Duration from the slide count using the existing duration calculation, clamped to the inclusive range from `VIDEO_CONFIG.minDurationSeconds` to `VIDEO_CONFIG.maxDurationSeconds`.
+12. IF the User submits a Target_Duration outside the inclusive range from `VIDEO_CONFIG.minDurationSeconds` to `VIDEO_CONFIG.maxDurationSeconds`, THEN THE System SHALL reject the render request with an `invalid_input` error and an HTTP 400 response stating the permitted range, and prevent the rendering process from starting.
+13. WHEN a valid Target_Duration is provided, THE Renderer SHALL distribute the Target_Duration across the Storyboard slides so that the total Video_File duration equals the Target_Duration to within one second per slide of rounding, while keeping each slide on screen for at least 1 second.
+14. THE Renderer SHALL produce a Video_File whose duration remains within the minimum and maximum bounds defined in Requirement 4.5, and THE System SHALL NOT accept a Target_Duration outside those bounds.
 15. WHEN rendering a slide, THE Renderer SHALL wrap the slide title and body text at word boundaries so that no rendered line extends beyond the slide's text area, preserving explicit line breaks in the source text, and SHALL break a single word across lines only when that word alone is wider than the text area.
 16. IF the wrapped slide body text exceeds the vertical space available on the slide, THEN THE Renderer SHALL render only the lines that fit in full and SHALL end the last rendered line with an ellipsis to indicate truncation.
 

@@ -28,10 +28,16 @@ export interface RenderJobState {
  *
  * @param slides - The ordered slide array to render; the hook fires when
  *   this is a non-empty array. Pass an empty array to skip rendering.
+ * @param targetDurationSeconds - Optional target total video duration in
+ *   seconds, forwarded in the render request body. When omitted, the server
+ *   derives a default from the slide count.
  * @returns A {@link RenderJobState} object with percent, jobId, status,
  *   error, and a cancel function.
  */
-export function useRenderJob(slides: Slide[]): RenderJobState {
+export function useRenderJob(
+  slides: Slide[],
+  targetDurationSeconds?: number,
+): RenderJobState {
   const [percent, setPercent] = useState<number>(0);
   const [jobId, setJobId] = useState<string | null>(null);
   const [status, setStatus] = useState<RenderJobStatus | "idle">("idle");
@@ -58,7 +64,11 @@ export function useRenderJob(slides: Slide[]): RenderJobState {
         const response = await fetch("/api/render", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ slides }),
+          body: JSON.stringify(
+            targetDurationSeconds !== undefined
+              ? { slides, targetDurationSeconds }
+              : { slides },
+          ),
           signal: controller.signal,
         });
 
@@ -117,7 +127,7 @@ export function useRenderJob(slides: Slide[]): RenderJobState {
       controller.abort();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slides]);
+  }, [slides, targetDurationSeconds]);
 
   const cancel = useCallback(async (): Promise<void> => {
     const id = jobIdRef.current;

@@ -14,6 +14,7 @@ import { analyzeRepository, validateAndExtractTokens } from "./analyzer.js";
 import { generateStoryboard } from "./storyboard.js";
 import { videoRenderer } from "./renderer.js";
 import { analysisCache, AnalysisCache } from "./cache.js";
+import { VIDEO_CONFIG } from "../config/output.js";
 import { ApiError, ApiErrorCode, Slide } from "../types/index.js";
 
 // ---------------------------------------------------------------------------
@@ -22,6 +23,7 @@ import { ApiError, ApiErrorCode, Slide } from "../types/index.js";
 
 const HTTP_STATUS: Record<ApiErrorCode, number> = {
   invalid_url: 400,
+  invalid_input: 400,
   repo_not_found: 404,
   rate_limit_exceeded: 429,
   request_timeout: 504,
@@ -156,8 +158,13 @@ router.get(
 /**
  * Start a video render job for the provided slides.
  *
- * Opens a Server-Sent Events stream. Emits `data: {"percent": N}` events
- * during encoding and `data: {"percent": 100, "jobId": "<id>"}` on completion.
+ * Accepts a request body of `{ slides: Slide[], targetDurationSeconds?: number }`.
+ * The optional `targetDurationSeconds` is validated against
+ * `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]` before
+ * the SSE stream is opened; an out-of-range or non-numeric value returns
+ * `HTTP 400 { error: "invalid_input" }` with no stream. Opens a Server-Sent
+ * Events stream on success. Emits `data: {"percent": N}` events during
+ * encoding and `data: {"percent": 100, "jobId": "<id>"}` on completion.
  *
  * @remarks
  * The SSE connection stays open until rendering completes or fails.
@@ -166,7 +173,10 @@ router.post(
   "/render",
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const { slides } = req.body as { slides?: unknown };
+      const { slides, targetDurationSeconds } = req.body as {
+        slides?: unknown;
+        targetDurationSeconds?: unknown;
+      };
 
       if (!Array.isArray(slides) || slides.length === 0) {
         res.status(422).json({
@@ -174,6 +184,28 @@ router.post(
           message: "A non-empty `slides` array is required.",
         });
         return;
+      }
+
+      // Validate the optional Target_Duration BEFORE switching into SSE mode,
+      // so the error path never rides the SSE channel. An absent value is
+      // allowed (the renderer derives a default from the slide count).
+      let validatedDuration: number | undefined;
+      if (targetDurationSeconds !== undefined) {
+        const value = Number(targetDurationSeconds);
+        const { minDurationSeconds: min, maxDurationSeconds: max } =
+          VIDEO_CONFIG;
+        if (
+          !Number.isFinite(value) ||
+          value < min ||
+          value > max
+        ) {
+          res.status(400).json({
+            error: "invalid_input",
+            message: `targetDurationSeconds must be a number between ${min} and ${max} seconds.`,
+          });
+          return;
+        }
+        validatedDuration = value;
       }
 
       // Set SSE headers before writing any data
@@ -188,7 +220,11 @@ router.post(
         }
       };
 
-      const job = await videoRenderer.start(slides as Slide[], onProgress);
+      const job = await videoRenderer.start(
+        slides as Slide[],
+        onProgress,
+        validatedDuration,
+      );
 
       if (!res.writableEnded) {
         res.write(

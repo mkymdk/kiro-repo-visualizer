@@ -181,6 +181,88 @@ Run against the completed implementation:
 
 ---
 
+# Implementation Plan: Download-flow Features (Run-Instructions Slide + Target Duration)
+
+## Overview
+
+Two independent extensions to the existing pipeline:
+
+- **Feature A — "How to run this repository" slide** (Requirements 3.9–3.13). A new `"run"` slide type extracted from the already-fetched README section (Installation / Getting Started / Setup / Usage / Quick Start), assembled purely in `storyboard.ts`, positioned after architecture and before highlights. No new GitHub calls, no repository code execution.
+- **Feature B — user-selectable video duration** (Requirements 4.10–4.14). A user-chosen `Target_Duration` within `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`, validated pre-SSE in `routes.ts` (new `invalid_input` / HTTP 400 code), threaded through `useRenderJob` and `VideoExport`, consumed by `calculateSecondsPerSlide`.
+
+The two features share only the config/type foundation (wave 0) and the final verification (last wave). Their feature-specific work does not cross modules, so it runs in parallel.
+
+## Tasks
+
+- [x] 13. Shared foundation — config, types, steering
+  - [x] 13.1 Add `runMaxSteps` (8) and `runMaxWordsPerStep` (20) to `SLIDE_CONFIG` in `src/config/output.ts` (values only; imported by name everywhere else)
+  - [x] 13.2 Add `"run"` member to the `SlideType` union in `src/types/index.ts` and update its doc comment
+  - [x] 13.3 Add `"invalid_input"` member to the `ApiErrorCode` union in `src/types/index.ts` and update its doc comment
+  - [x] 13.4 Add the `invalid_input` row (HTTP 400 — malformed/out-of-range request parameter) to the standard error-code table in `.kiro/steering/api-error-handling.md`
+  - [x] 13.5 Verify `npm run build` compiles cleanly with the new union members and config keys
+
+- [x] 14. Feature A — run-instructions slide (storyboard.ts)
+  - [x] 14.1 Implement an unexported `extractRunInstructions(readmeText: string): { heading: string; steps: string[] } | null` helper — finds the first Markdown heading matching (case-insensitive) `Installation|Getting Started|Setup|Usage|Quick Start` in document order, returns its section content
+  - [x] 14.2 Within the extractor, prefer the first fenced code block in the matched section as the step source (split into lines, cap at `SLIDE_CONFIG.runMaxSteps`); fall back to non-blank prose lines when no code block is present
+  - [x] 14.3 Truncate each step to `SLIDE_CONFIG.runMaxWordsPerStep` words via `truncateToWords`; HTML-escape all output
+  - [x] 14.4 Implement exported `buildRunSlide(readmeText: string | null): Slide | null` — returns `null` when README is absent or no heading matches; otherwise builds a `"run"` slide with heading title, step body, and a `previewSummary` capped at `SLIDE_CONFIG.previewMaxWords`
+  - [x] 14.5 Insert the run slide into `generateStoryboard` immediately after architecture and before highlights; include it in the `fixedCount` used for the `maxSlides` highlight-trim math so the count stays within `[minSlides, maxSlides]`
+  - [x] 14.6 Extend `tests/storyboard.test.ts`: heading-keyword matching, fenced-code-block preference over prose, first-match-in-document-order, `runMaxSteps`/`runMaxWordsPerStep` truncation, graceful omission (no README / no match), and ordering assertion (run slide index is directly after architecture)
+
+- [x] 15. Feature B — target duration (renderer.ts, routes.ts, hook, component)
+  - [x] 15.1 Change `calculateSecondsPerSlide(slideCount: number, targetDurationSeconds?: number): number` — when a target is supplied, distribute it across slides (floor at 1s); when omitted, keep existing slide-count-derived default; update the TSDoc (Args/Returns/Raises)
+  - [x] 15.2 Thread the target through `VideoRenderer.start(slides, onProgress, targetDurationSeconds?)`, passing it to `calculateSecondsPerSlide`; update TSDoc
+  - [x] 15.3 In `routes.ts`, add `invalid_input: 400` to the `HTTP_STATUS` map
+  - [x] 15.4 In `POST /api/render`, read `targetDurationSeconds` from the body and validate it **before** setting SSE headers — reject non-finite or out-of-range values with `HTTP 400 { error: "invalid_input", message: <permitted range> }`; pass a valid value (or `undefined`) to `videoRenderer.start`
+  - [x] 15.5 In `useRenderJob.ts`, accept an optional `targetDurationSeconds` and include it in the `POST /api/render` JSON body; update the hook's param types/TSDoc and effect dependencies
+  - [x] 15.6 In `VideoExport.tsx`, add a duration selector (range/number input) bounded by `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds`, defaulted sensibly, with an accessible `<label>`; pass the chosen value into `useRenderJob`
+  - [x] 15.7 Extend `tests/renderer.test.ts`: `calculateSecondsPerSlide` with an explicit in-range target, the 1s-per-slide floor, and the default (no-target) path
+  - [x] 15.8 Add `tests/routes.test.ts`: out-of-range target → 400 `invalid_input` with no SSE stream; non-numeric target → 400; in-range target → render proceeds; absent target → derived default
+
+- [x] 16. End-to-end validation for both features
+  - [x] 16.1 Run `npm test`; ensure new and existing suites pass and `src/server/` coverage stays ≥ 80%
+  - [x] 16.2 Run `npm run build`; verify zero TypeScript errors across frontend and backend
+  - [x] 16.3 Grep to confirm no inline literals for the new governed constants (`8`, `20`) or duration bounds leaked outside `src/config/output.ts`
+  - [x] 16.4 Verify Property 3 (updated ordering incl. run slide) and Property 7 (Target Duration Is Range-Bounded) hold against the implementation
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    {
+      "id": 0,
+      "tasks": ["13.1", "13.2", "13.3", "13.4", "13.5"]
+    },
+    {
+      "id": 1,
+      "tasks": [
+        "14.1", "14.2", "14.3", "14.4", "14.5",
+        "15.1", "15.2", "15.3", "15.4", "15.5", "15.6"
+      ]
+    },
+    {
+      "id": 2,
+      "tasks": ["14.6", "15.7", "15.8"]
+    },
+    {
+      "id": 3,
+      "tasks": ["16.1", "16.2", "16.3", "16.4"]
+    }
+  ]
+}
+```
+
+## Notes
+
+- Wave 0 is the only shared prerequisite: both features depend on the config keys and union members landing first (per output-constants.md §2.3, config follows requirements, which are already merged). Task 13.4 keeps api-error-handling.md's code table in sync with the new `invalid_input` code.
+- Wave 1 is fully parallel: Feature A touches only `storyboard.ts`; Feature B touches `renderer.ts`, `routes.ts`, `useRenderJob.ts`, and `VideoExport.tsx`. There is no file overlap between the two features, so 14.x and 15.x can proceed simultaneously.
+- Wave 2 is the test-authoring pass for both features (kept separate from implementation so a failing test points at implementation, not scaffolding).
+- Component boundaries are unchanged: README section extraction is pure string work and stays in `storyboard.ts`; no new GitHub calls are added to `analyzer.ts`; duration validation lives in `routes.ts` and duration math in `renderer.ts`.
+- The `invalid_input` validation must run before `res.flushHeaders()` so the error never rides the SSE channel (design.md Error Handling flow).
+
+---
+
 # Implementation Plan: Repository-Focused Storyboard
 
 ## Overview
@@ -311,6 +393,7 @@ This plan supersedes the slide ordering from tasks 4.8 and 14.5 (run slide after
 | 4 | Partial Extraction Does Not Abort | PASS | analyzer tests: failing step recorded, tree failure records specDocs, 404/[] sources not recorded |
 | 5 | Render Job Isolation | PASS | existing renderer path tests (unchanged) |
 | 6 | Cancellation Is Time-Bounded | PASS | existing abort tests (unchanged) |
+| 7 | Target Duration Is Range-Bounded | PASS | `tests/routes.test.ts`; manual e2e 400 + in-range render per fixture |
 | 8 | Content Is Never Fabricated | PASS | corpus-substring property test on all 4 fixtures |
 | 9 | Slide Caps Are Ceilings | PASS | cap assertions + metamorphic noise injection on all 4 fixtures |
 | 10 | Evolution Anchored / feat Fallback | PASS | property test + fallback accept/reject cases |

@@ -262,7 +262,7 @@ Converts a `Slide[]` into an MP4 file. Runs on the server.
 **Rendering pipeline:**
 1. For each slide, lay out text (below), render `VIDEO_CONFIG.fps` frames × `secondsPerSlide` onto a `VIDEO_CONFIG.width × VIDEO_CONFIG.height` canvas, producing a PNG frame sequence
 2. Pipe the frame sequence to ffmpeg with codec `libx264`, container `mp4`, frame rate `VIDEO_CONFIG.fps`
-3. Calculate `secondsPerSlide` = `clamp(totalDuration / slideCount, minPerSlide, maxPerSlide)` where `totalDuration` is derived to keep output within `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds`
+3. Calculate `secondsPerSlide` by distributing a `targetDurationSeconds` across the slides. `calculateSecondsPerSlide(slideCount, targetDurationSeconds?)` accepts an optional caller-supplied Target_Duration; when omitted it derives a default from the slide count. The provided value is asserted to lie within `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds` (the route rejects out-of-range values with `invalid_input` before rendering starts), and each slide is floored at 1 second so the total matches the target to within one second per slide of rounding
 4. Write output to a temp file at `os.tmpdir()/{renderJobId}.mp4`
 
 **Text layout (Req 4.15, 4.16):** This replaces today's `line.slice(0, 100)`, which cuts mid-word and ignores the actual glyph width.
@@ -287,11 +287,13 @@ Converts a `Slide[]` into an MP4 file. Runs on the server.
 |---|---|---|---|
 | `POST` | `/api/analyze` | `RepositoryAnalyzer` | Validate URL, fetch repo data |
 | `GET` | `/api/storyboard` | `StoryboardGenerator` | Generate slides from cached analysis |
-| `POST` | `/api/render` | `VideoRenderer` | Start render job, return SSE stream |
+| `POST` | `/api/render` | `VideoRenderer` | Start render job, return SSE stream. Body: `{ slides: Slide[], targetDurationSeconds?: number }` |
 | `DELETE` | `/api/render/:jobId` | `VideoRenderer.abort` | Cancel in-progress render |
 | `GET` | `/api/download/:jobId` | file stream | Stream completed MP4 to browser |
 
 All routes apply a top-level error handler that maps `ApiError` codes to HTTP status codes and returns the standard `{ "error": "...", "message": "..." }` JSON shape.
+
+The `POST /api/render` handler validates the optional `targetDurationSeconds` **before** switching the response into SSE mode. When present, it must be a finite number within `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds`; otherwise the handler returns a standard `HTTP 400 { "error": "invalid_input", "message": "..." }` JSON response and does not open the SSE stream. When absent, the renderer derives the default duration from the slide count.
 
 No route changes are needed for the storyboard redesign. `partialFailures` can now also contain `metadata`, `pullRequests`, and `releases`; `AnalysisProgress` lists these names as it does today.
 
@@ -408,6 +410,7 @@ class ApiError extends Error {
 
 type ApiErrorCode =
   | "invalid_url"
+  | "invalid_input"
   | "repo_not_found"
   | "rate_limit_exceeded"
   | "request_timeout"
@@ -473,6 +476,12 @@ Each render job writes its output to a unique temp file path derived from a UUID
 Calling `abort()` on an active render job guarantees that the ffmpeg process is terminated and the partial output file is deleted within `VIDEO_CONFIG.cancelTimeoutSeconds` (3 seconds) of the cancellation request.
 
 **Validates: Requirements 4.8**
+
+### Property 7: Target Duration Is Range-Bounded
+
+Every render job accepted by `POST /api/render` has a Target_Duration within the inclusive range `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`: an explicit value outside that range (or a non-numeric value) is rejected with `invalid_input` (HTTP 400) before rendering begins, and an absent value is replaced by a default derived from the slide count and clamped to the same range. The produced video's total duration equals the Target_Duration to within one second per slide of rounding, with each slide floored at 1 second.
+
+**Validates: Requirements 4.10, 4.11, 4.12, 4.13, 4.14**
 
 ### Property 8: Content Is Never Fabricated
 
@@ -543,12 +552,19 @@ POST /api/analyze
           └─ insufficient_content → HTTP 422, error screen, halt
                │
                ▼
-          POST /api/render  (SSE stream)
+          POST /api/render  (target duration validated pre-SSE)
                │
+               ├─ invalid_input       → HTTP 400 JSON, no SSE stream opened
+               │                        (Target_Duration out of range or non-numeric)
+               ├─ insufficient_content → HTTP 422 JSON (empty slides array)
+               │
+               ▼  (validation passed → SSE stream opens)
                ├─ SSE percent updates → progress bar
                ├─ render failure      → error banner + retry button
                └─ cancel              → DELETE /api/render/:id
 ```
+
+The `invalid_input` code (HTTP 400) is distinct from `insufficient_content` (HTTP 422): the former signals a malformed or out-of-range render parameter (Target_Duration), the latter signals that the repository cannot produce the minimum slide count. Both are validated before the SSE stream is opened so the error path never rides the SSE channel.
 
 Missing optional content (no releases, no PRs, no features section) is not an error at any layer. It only shapes which slides are produced.
 
@@ -570,6 +586,7 @@ Plus a hostile fixture whose every text field contains HTML metacharacters.
 - **`tests/analyzer.test.ts`** — URL validation; metadata step as the `repo_not_found` source; commit subject/body mapping; PR mapping (merged-only, `isBot`, lowercased labels, body cap); release mapping (drafts dropped); 404 and `[]` for PRs, releases, and specs are empty results, not partial failures; spec selection (4-level paths found, requirements/design priority, path-ordered ties, cap of 6, > 1 MB skipped, invalid paths rejected, segments encoded); spec step recorded when tree fails; timeout and rate-limit paths.
 - **`tests/storyboard.test.ts`** — per-section extraction and README → spec fallback for capabilities, how-it-works, and features; overview paragraph skips badges and headings and truncates at `introMaxWords`; "Usage" never feeds capabilities; overlap omission at, above, and below the ratio; described vs. name-only features and the summary slide under the cap; anchor tokenization, `GENERIC_TERMS` exclusion, and prefix matching; Significant_PR filters and category precedence; ranking; patch-release detection; timeline minimum, cap, and chronology; deep-dive exclusion of Bug Fix; release deep dives only when PR deep dives fall short; commit fallback, PR-reference dedup, and bug-fix exclusion; empty-anchor fallback (`feat:`/`feat(scope)!:` accepted; `fix:`, `docs:`, `chore:`, `feat(deps):`, `Add …`, and substring-only matches rejected; `maxFallbackHighlights` ceiling; no timeline from commits); history-invariance of current-state slides (Property 14); Change_Context stripping (comments, checklists, headings, trailers, code fences); ordering (Property 3); ceiling metamorphic tests (Property 9); anchoring (Property 10); escaping for every slide type (Property 11); existing run-slide tests with the new position.
 - **`tests/renderer.test.ts`** — `wrapText` with a fake `measure` (explicit breaks, blank lines, long-word breaking, exact-fit lines); `fitLines` ellipsis behaviour; title max lines; existing duration, abort, and sweep tests unchanged.
+- **`tests/routes.test.ts`** — unchanged.
 
 ### Integration Tests
 
@@ -605,7 +622,7 @@ kiro-repo-visualizer/
 │   │   ├── UrlInput.tsx           # Step 1 — URL form
 │   │   ├── AnalysisProgress.tsx   # Step 2 — loading/partial-data state
 │   │   ├── StoryboardPreview.tsx  # Step 3 — slide preview, reorder, remove
-│   │   └── VideoExport.tsx        # Step 4 — progress bar, download, cancel
+│   │   └── VideoExport.tsx        # Step 4 — duration, progress bar, download, cancel
 │   ├── hooks/
 │   │   └── useRenderJob.ts        # React hook wrapping the SSE render stream
 │   └── App.tsx                    # Top-level step router
@@ -614,6 +631,7 @@ kiro-repo-visualizer/
 │   ├── analyzer.test.ts
 │   ├── storyboard.test.ts
 │   ├── renderer.test.ts
+│   ├── routes.test.ts
 │   ├── integration.test.ts
 │   ├── cache.test.ts
 │   └── config.test.ts
