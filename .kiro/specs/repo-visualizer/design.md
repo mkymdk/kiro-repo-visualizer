@@ -90,6 +90,12 @@ Owns all GitHub API communication. Called by `POST /api/analyze`.
 
 **Scheduling:** Steps 1, 2, 3, 4, 6, and 7 run concurrently via `Promise.allSettled`. Step 5 starts when step 2 resolves because it selects files from the unfiltered tree. Spec files sit four levels deep (`.kiro/specs/<name>/requirements.md`), below the 3-level cut applied to `directoryTree`. If step 2 fails, step 5 is skipped and both names are recorded in `partialFailures`.
 
+**Step 8: selected-PR commit lookup (lazy, Req 2.11, 2.12).** `fetchSelectedPrCommits(owner, repo, prNumbers): Promise<PrCommitEvidence>` runs after analysis, only for the PR numbers the storyboard asks for.
+- Endpoint: `GET /repos/{owner}/{repo}/pulls/{pull_number}/commits?per_page=100`, one page per PR. The URL is built from validated `owner`/`repo` tokens and a PR number checked to be a positive safe integer. The host is asserted as for every request.
+- At most `MAX_SELECTED_PR_LOOKUPS` (3) requests, an analyzer module constant beside `MAX_SPEC_FILES`. Extra numbers are ignored. Duplicate numbers are fetched once. An empty list makes no request.
+- Each lookup is independent. Any failure for a PR (timeout, non-2xx, rate limit, malformed JSON, redirect) leaves that PR out of the result and is logged server-side. The function never throws, so a lookup can never fail analysis or storyboard generation.
+- Result: `Record<prNumber, string[]>` of commit SHAs exactly as GitHub returned them. For PRs with more than 100 commits only the first page is used. That evidence is still exact, just possibly incomplete, and the graph covers the rest where it can.
+
 **Accessibility check (Req 1.4):** The metadata response is the authoritative accessibility signal. A 404, or a 403 that is not a rate-limit response, raises `repo_not_found`. This replaces the current inference from the tree step.
 
 **Spec file selection (Req 2.3):**
@@ -99,12 +105,22 @@ Owns all GitHub API communication. Called by `POST /api/analyze`.
 4. Fetch each file with every path segment passed through `encodeURIComponent`, and assert the host before fetching (Security Constraint 7).
 
 **Normalization:**
-- **Commit:** `subject` is the first line. `body` is the remainder with leading blank lines trimmed; trailer removal happens in the storyboard's Change_Context extraction. `message` is kept as an alias of `subject` for existing callers.
-- **PullRequest:** only items with `merged_at` set. `labels` are lowercased names. `isBot` is true when `user.type === "Bot"` or the login ends in `[bot]`. `body` is capped at `MAX_CHANGE_BODY_CHARS` (10 000), since only its first sentence is used.
+- **Commit:** `subject` is the first line. `body` is the remainder with leading blank lines trimmed; trailer removal happens in the storyboard's Change_Context extraction. `message` is kept as an alias of `subject` for existing callers. `parents` is the list of parent SHAs from the same commits response (`parents[].sha`); `[]` when absent.
+- **PullRequest:** only items with `merged_at` set. `labels` are lowercased names. `isBot` is true when `user.type === "Bot"` or the login ends in `[bot]`. `body` is capped at `MAX_CHANGE_BODY_CHARS` (10 000), since only its first sentence is used. `mergeCommitSha` is `merge_commit_sha` from the same pulls response, or `null`.
+
+PR-to-commit association uses only these two fields, which the existing commits and pulls requests already return. It adds **no requests**, so the budget stays at a maximum of 12 per uncached analysis. The analyzer only carries the raw data; grouping happens in the storyboard (Stage 3b). The `per_page=50` commit window is unchanged, and Stage 3b treats it as a hard boundary.
 - **Release:** drafts are dropped. `body` is capped at `MAX_CHANGE_BODY_CHARS`.
 - **RepoMetadata:** `description`, `topics`, `stargazers_count`, `language`, and `license.spdx_id` (or `license.name`), each nullable.
 
-**Request budget:** 6 fixed requests plus up to 6 spec files, so ≤ 12 per uncached analysis (previously ~4 plus top-level `.kiro` files). Unauthenticated, that allows roughly 5 uncached analyses per hour per IP; the analysis cache and `GITHUB_PERSONAL_ACCESS_TOKEN` mitigate this.
+**Request budget:**
+
+| Phase | Requests | When |
+|---|---|---|
+| Analysis (steps 1–7) | 6 fixed + up to 6 spec files = **≤ 12** | Every uncached analysis |
+| Selected-PR commit lookup (step 8) | **≤ 3**, one per Selected_PR that needs it | Only during storyboard generation, only for Selected_PRs whose membership the graph can't prove |
+| **Total** | **≤ 15** per uncached analysis | |
+
+Unauthenticated (60 requests per hour), that is about 4 uncached analyses per hour per IP in the worst case. The analysis cache and `GITHUB_PERSONAL_ACCESS_TOKEN` mitigate this. A cache hit costs 0 requests, including step 8, because the evidence is cached with the analysis.
 
 **Return type:**
 ```typescript
@@ -179,11 +195,56 @@ Anchor terms come only from current-state content. Commits, PRs, and releases ne
 | Deep-dive PR (7.5) | Timeline PR ∧ category ≠ Bug Fix | as above | rank |
 | Timeline release (7.4) | not a Patch_Release (`^v?\d+\.\d+\.(\d+)` with group > 0) | "Release" | newest first |
 | Deep-dive release (7.6) | timeline release ∧ Change_Context ≠ null ∧ relevant | "Release" | newest first |
-| Engineering_Highlight (7.9, anchors ≠ ∅) | subject keyword match ∧ category ≠ Bug Fix ∧ relevant ∧ no `(#N)`/`Merge pull request #N` for a presented PR | keyword mapping | commit order |
-| Fallback highlight (7.14, anchors = ∅) | subject matches `^feat(\([^)]*\))?!?:` ∧ no `bump\|deps\|dependency\|dependencies` ∧ no presented-PR reference | "Feature" | most recent first, ≤ `maxFallbackHighlights` |
+| Engineering_Highlight (7.9, anchors ≠ ∅) | subject keyword match ∧ category ≠ Bug Fix ∧ relevant ∧ allowed by the Change_Group rule (7.15) | keyword mapping | commit order |
+| Fallback highlight (7.14, anchors = ∅) | subject matches `^feat(\([^)]*\))?!?:` ∧ no `bump\|deps\|dependency\|dependencies` ∧ allowed by the Change_Group rule (7.15) | "Feature" | most recent first, ≤ `maxFallbackHighlights` |
 
 Bug-fix PRs can appear as one-line timeline entries when relevant, but never consume a deep-dive slide. Bug-fix commits are never used.
 
+#### Stage 3b: Change_Groups (one logical change, one detailed slot)
+
+`buildChangeGroups(commits, pullRequests): ChangeGroups` is a pure function of graph data. It never reads commit messages, and it only groups commits it can prove belong together from the fetched window (Req 7.17).
+
+1. Index the window: `sha → parents` for the 50 fetched commits.
+2. `walk(start)` follows parent links through commits **in the window only** and returns `{ reached, complete }`. `complete` is false as soon as the walk meets a parent SHA that is not in the window. Commits with no parents (repository roots) end a walk without making it incomplete.
+3. For every Merge_Commit `M` (≥ 2 parents), newest first in window order:
+   - `first = walk(parents[0])`, `branch = walk(parents[1])`
+   - If `first.complete`: group = `{M} ∪ (branch.reached \ first.reached)`, minus commits already assigned.
+   - Otherwise: group = `{M}` only. Non-ancestry of the first parent can't be proven, because a commit reachable from the second parent might be reached from the first parent through commits outside the window.
+   - A commit keeps its first assignment, so nested merges never claim the same commit twice.
+4. For every merged PR whose `mergeCommitSha` is in the window: if it is a Merge_Commit, step 3's group gets the PR number. If it is a single-parent commit (squash, or the tip of a rebase), the group is `{that commit}` with the PR number.
+5. Every remaining commit is its own group.
+6. A PR whose `mergeCommitSha` is `null` or outside the window has no known group (Req 7.16).
+
+Selection rule (Req 7.15), applied in Stage 4:
+- `blockedGroups` starts as the groups of the PR deep dives emitted so far.
+- A commit is a highlight candidate only if it is **not** a Merge_Commit, its group is not in `blockedGroups`, and no earlier highlight used the same group.
+- When a highlight is emitted, its group is added to `blockedGroups`.
+- Timeline entries never add to `blockedGroups`. A PR can be both a timeline line and a deep dive.
+- The old subject-based `(#N)` / `Merge pull request #N` exclusion is removed. It is not kept as a fallback.
+
+| Merge style / situation | Graph membership (Stage 3b) | Step 8 lookup | Live evidence |
+|---|---|---|---|
+| Merge commit, first-parent ancestry inside the window | Merge commit + every provable branch commit | Not needed, so not requested | This repo, PR #9 → 4 commits (21 commits total) |
+| Merge commit, first-parent ancestry leaves the window | Merge commit only | **Requested if selected.** Branch commits keep their SHAs on the base branch, so the returned SHAs match exactly | `rails/rails` #58882, #58883: second parent = PR head, 1/1 SHAs on base; `systemd/systemd` #43827: 4/4 SHAs on base |
+| Squash | The single squashed commit (`mergeCommitSha`) | Not requested: the endpoint returns the pre-squash commits, which aren't on the base branch | `chalk/chalk` #689: 0/1 SHAs on base |
+| Rebase | The last rebased commit (`mergeCommitSha`) | Not requested: rebasing rewrites SHAs, so returned SHAs don't match the base branch | Single-parent merges on `systemd/systemd` and `chalk/chalk`: 0/1 SHAs on base. A multi-commit rebase was not observed (F3) |
+| PR data unavailable | Merge_Commit topology alone (steps 3 and 5) | No PR numbers, so no lookup | Pulls step failed |
+
+**Known limitations (accepted):**
+- **50-commit window, graph only.** Graph-proven membership stops at the window. Merge commits with first-parent ancestry outside it group only themselves (live: every merge commit in `rails/rails` and `kubernetes/kubernetes`). For Selected_PRs, Stage 3c closes this gap with exact GitHub evidence. For commits of PRs that aren't selected, it stays: two commits from the same unselected merge-style PR may still each get a highlight (F2).
+- **Rebase merges.** Only the last rebased commit is linked to its PR. The PR-commit endpoint can't help because rebasing rewrites SHAs (Req 7.18, F3).
+- Neither gap is compensated by commit-message inference, commit dates, or listing order.
+
+#### Stage 3c: Selected PRs and exact evidence (Req 2.11, 2.12, 7.15)
+
+The storyboard stays pure. It is generated in two passes around one lazy analyzer call:
+
+1. `selectDeepDivePullRequests(result): number[]` (pure) runs Stage 2 anchors and the Stage 3/4 PR ranking and returns the PR numbers that get deep dives. It never reads evidence.
+2. `prsNeedingEvidence(result, selected): number[]` (pure) keeps only Selected_PRs whose `mergeCommitSha` is a Merge_Commit in the window with an incomplete first-parent walk. Squash, rebase, graph-proven merges, and PRs with an unknown merge commit need no lookup.
+3. The pipeline calls `fetchSelectedPrCommits` with that list. If the list is empty, there is no request.
+4. `generateStoryboard(result, evidence?)` builds the slides. A commit belongs to a Selected_PR if it is in the PR's graph group **or** its SHA is in that PR's evidence. Evidence SHAs that aren't in the window are ignored, and evidence for non-selected PRs is ignored. Without evidence the result equals graph-only behavior.
+
+Deep-dive selection never depends on evidence, so passes 1 and 4 select the same PRs. The pipeline stores the evidence with the cached analysis, so later storyboard requests in the TTL window make no lookups.
 #### Stage 4: Evolution allocation (ceiling, not target)
 
 ```
@@ -191,13 +252,19 @@ remaining = maxEvolutionSlides
 timeline  = (eligible releases newest-first, then timeline PRs by rank)
               .slice(0, maxEvolutionItems).sortBy(date asc)
 if timeline.length >= minEvolutionItems: emit Evolution_Timeline; remaining -= 1
-for pr of deepDivePRs      while remaining > 0: emit change(pr);      remaining -= 1
+groups  = buildChangeGroups(commits, pullRequests)
+blocked = {}
+for pr of deepDivePRs      while remaining > 0: emit change(pr);      blocked += group(pr) ∪ evidence(pr); remaining -= 1
 for rel of deepDiveReleases while remaining > 0: emit change(rel);    remaining -= 1
+candidates = commits where not merge commit and group ∉ blocked and sha ∉ blocked
 highlights = anchors.size > 0
-  ? relevantHighlights
-  : fallbackHighlights.slice(0, maxFallbackHighlights)
-for c of highlights         while remaining > 0: emit highlight(c);   remaining -= 1
+  ? relevantHighlights(candidates)
+  : fallbackHighlights(candidates)
+for c of highlights         while remaining > 0 and group(c) ∉ blocked:
+                              emit highlight(c); blocked += group(c); remaining -= 1
 ```
+
+`maxFallbackHighlights` still caps the fallback path, and it counts after the group rule is applied.
 
 Allocation stops when candidates run out. Nothing is repeated or padded (Req 3.12, 7.13). When neither releases nor PRs qualify, there is no timeline (7.8) and commit highlights are the only evolution content.
 
@@ -273,7 +340,20 @@ Converts a `Slide[]` into an MP4 file. Runs on the server.
 - `maxWidth = VIDEO_CONFIG.width − 2 × LAYOUT.margin`. Body `maxLines` is derived from the space between the body top and `VIDEO_CONFIG.height − LAYOUT.margin`.
 - HTML-entity decoding, currently duplicated for title and body, moves into one `decodeHtmlEntities` helper.
 
-**Progress reporting:** The render route uses Server-Sent Events (SSE). The renderer emits progress callbacks every `VIDEO_CONFIG.progressIntervalMs` (2 000 ms); the route handler forwards them as `data: {"percent": N}` SSE events.
+**Progress reporting (Req 4.3, 4.17, 4.18):** The render route uses Server-Sent Events (SSE). A timer guarantees the cadence, and ffmpeg only supplies values.
+
+- `ProgressTracker` (renderer module, exported for tests) holds the current estimate and emits it:
+  - `update(fraction)` stores a new value. The percentage is `min(99, max(previous, round(fraction × 100)))`, so it never decreases and never reaches 100 before completion. It does not emit.
+  - `start()` emits the current value immediately, then every `HEARTBEAT_MS` from a `setInterval`.
+  - `stop()` clears the interval and turns every later `update`/emit into a no-op. It is idempotent.
+- `HEARTBEAT_MS = VIDEO_CONFIG.progressIntervalMs / 2` (1 000 ms), a value derived from the governed constant. Emitting every half interval means one late timer tick still keeps the gap under 2 s. Every tick emits, even when the value hasn't changed, so the cadence never depends on progress being made.
+- Phases share one 0–99 scale: frame preparation covers the first `FRAME_PHASE_WEIGHT` (0.1), and encoding covers the rest based on ffmpeg's `frames` count. Both are renderer-module constants (presentation detail, not spec constants).
+- Frame preparation yields to the event loop (`await setImmediate`) after each slide, so the timer can fire while frames are drawn. Today the drawing loop blocks the event loop.
+- `start()` wraps the whole job in `try/finally { tracker.stop() }`, so the timer is cleared on success, failure and cancellation. The renderer no longer calls `onProgress(100)`. The route sends the single terminal event, `{"percent":100,"jobId":…}`.
+- The route adds a `closed` flag, set on completion, on error, and on `res.on("close")` (client disconnect). The `onProgress` sink checks it before every write.
+- `VideoRenderer` keeps each active job's tracker. `abort(jobId)` stops that tracker before deleting the output file, so the existing cancellation path also releases the timer. Whether ffmpeg itself is stopped is not changed in this cycle (follow-up F1 in tasks.md).
+
+The route's error branch is the one rewritten by the unmerged `fix/render-sse-double-error-handling` (`b07c4b4`). This work builds on that change. It does not rewrite the same lines independently.
 
 **Cancellation:** The renderer exposes an `abort()` method. When called, it signals ffmpeg to terminate and deletes the partial output file within `VIDEO_CONFIG.cancelTimeoutSeconds` (3 s).
 
@@ -295,7 +375,24 @@ All routes apply a top-level error handler that maps `ApiError` codes to HTTP st
 
 The `POST /api/render` handler validates the optional `targetDurationSeconds` **before** switching the response into SSE mode. When present, it must be a finite number within `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds`; otherwise the handler returns a standard `HTTP 400 { "error": "invalid_input", "message": "..." }` JSON response and does not open the SSE stream. When absent, the renderer derives the default duration from the slide count.
 
-No route changes are needed for the storyboard redesign. `partialFailures` can now also contain `metadata`, `pullRequests`, and `releases`; `AnalysisProgress` lists these names as it does today.
+`partialFailures` can now also contain `metadata`, `pullRequests`, and `releases`; `AnalysisProgress` lists these names as it does today.
+
+`GET /api/storyboard` is a transport boundary only. It reads and type-checks the `url` query parameter, calls `buildStoryboardForUrl(url)`, and returns the slides or passes the error to the top-level handler. It does not call the analyzer, the storyboard, or the cache directly.
+
+### 6a. Storyboard Pipeline (`src/server/pipeline.ts`)
+
+A small orchestration module, the only place where the analysis, selection, lookup and generation steps are sequenced. It holds no GitHub access (that stays in `analyzer.ts`) and no slide logic (that stays in `storyboard.ts`).
+
+`buildStoryboardForUrl(url): Promise<Slide[]>`:
+1. Validate the URL and derive the cache key from `owner`/`repo` tokens (`validateAndExtractTokens`, `AnalysisCache.keyFor`).
+2. Use the cached analysis if present, otherwise run `analyzeRepository(url)` and cache it if it is complete, as before.
+3. If the cached entry already holds `prCommitEvidence`, go straight to step 7: a cache hit makes no GitHub request.
+4. `selectDeepDivePullRequests(result)`, which never reads evidence.
+5. `prsNeedingEvidence(result, selected)` keeps only truncated merge-commit Selected_PRs.
+6. `fetchSelectedPrCommits(owner, repo, numbers)`, which makes ≤ 3 requests and never throws. Store the evidence on the analysis object, so a cached entry keeps it.
+7. `generateStoryboard(result, evidence)`.
+
+Errors from steps 1–2 (`invalid_url`, `repo_not_found`, rate limit, …) propagate unchanged, so the route's error mapping is unchanged. Step 6 can't fail the pipeline, and step 7's `insufficient_content` propagates as today. The `/api/analyze` route keeps its current behavior and makes no lookups.
 
 ---
 
@@ -319,6 +416,7 @@ interface Commit {
   subject: string;         // first line of the message
   body: string;            // remainder, leading blank lines trimmed; "" when absent
   message: string;         // alias of subject, kept for existing callers
+  parents: string[];       // parent SHAs; length ≥ 2 marks a Merge_Commit
 }
 
 interface PullRequest {
@@ -328,6 +426,7 @@ interface PullRequest {
   labels: string[];        // lowercased label names
   mergedAt: string;        // ISO 8601; only merged PRs are retained
   isBot: boolean;
+  mergeCommitSha: string | null; // merge_commit_sha; links the PR to its Change_Group
 }
 
 interface Release {
@@ -435,7 +534,8 @@ These are enforced in code, not just documented:
 5. **Response size cap** — all GitHub API response bodies are streamed and truncated at 10 MB. PR and release bodies are additionally capped at `MAX_CHANGE_BODY_CHARS` after parsing.
 6. **Content escaping** — all text from GitHub (README, descriptions, topics, spec docs, commit messages, PR titles and bodies, labels, release names and notes, file names) is HTML-escaped centrally in `makeSlide` before it reaches any slide field (Req 3.11, Property 11).
 7. **Spec path validation** — spec file paths come from the GitHub tree response and are untrusted. Each must match `^\.kiro/specs/.+\.md$`, contain no `.`, `..`, or empty segment, and is URL-encoded per segment before being placed in a `contents` URL. Paths are never used for local filesystem access.
-8. **No execution** — README code blocks, PR bodies, and release notes are treated as text only. Nothing from the repository is executed or evaluated.
+8. **PR number validation** — the PR numbers used in step 8 come from GitHub's pulls response and are untrusted. Each must be a positive safe integer before it is placed in a URL; anything else is dropped without a request.
+9. **No execution** — README code blocks, PR bodies, and release notes are treated as text only. Nothing from the repository is executed or evaluated.
 
 ---
 
@@ -525,6 +625,24 @@ The overview, capabilities, run, how-it-works, and feature slides, and the ancho
 
 **Validates: Requirements 3.13, 7.14**
 
+### Property 15: One Logical Change, At Most One Detailed Slot
+
+For every generated storyboard, no two Detailed_Evolution_Slides (notable-change or Engineering_Highlight) refer to the same Change_Group. No Engineering_Highlight refers to a Merge_Commit or to a commit in the Change_Group of a Pull_Request that has a notable-change slide. Change_Groups are determined only from `parents` and `mergeCommitSha`, so rewriting every commit subject and PR title leaves the group assignment unchanged. Groups are sound with respect to the window: every non-merge member of a Merge_Commit's group is reachable from its second parent inside the window, and the group has non-merge members only when the first parent's ancestry is fully inside the window. Adding commits outside the window to the input never adds a member to a group. For a Selected_PR, every window commit whose SHA GitHub reported for that PR is also excluded from highlights. Without evidence, the result is identical to graph-only grouping. Selected_PRs are the same with or without evidence. Evolution_Timeline entries are exempt: a Pull_Request may appear on the timeline and as a notable-change slide.
+
+**Validates: Requirements 2.11, 2.12, 7.9, 7.14, 7.15, 7.16, 7.17, 7.18**
+
+### Property 16: Progress Cadence Is Independent of the Encoder
+
+During a render, consecutive progress events are at most `VIDEO_CONFIG.progressIntervalMs` apart for any ffmpeg reporting pattern, including none at all, a single report, or reports landing just before the boundary. This holds during frame preparation as well as encoding. Reported percentages never decrease and stay ≤ 99 until the single terminal event at 100. No event is sent after completion, failure, cancellation, or client disconnect, and no progress timer remains active once the render settles.
+
+**Validates: Requirements 4.3, 4.17, 4.18**
+
+### Property 17: Selected-PR Lookups Are Lazy and Bounded
+
+For any analysis, the number of PR-commit requests equals the number of distinct Selected_PRs that need evidence, capped at 3, and is 0 when no Selected_PR needs evidence. No PR-commit request is made for a Pull_Request that is not a Selected_PR. Total GitHub requests for one uncached analysis plus its first storyboard never exceed 15, and a cached storyboard request makes none. A failed lookup never changes the HTTP outcome of analysis or storyboard generation.
+
+**Validates: Requirements 2.11, 2.12**
+
 ---
 
 ## Error Handling
@@ -583,10 +701,12 @@ Plus a hostile fixture whose every text field contains HTML metacharacters.
 
 ### Unit Tests
 
-- **`tests/analyzer.test.ts`** — URL validation; metadata step as the `repo_not_found` source; commit subject/body mapping; PR mapping (merged-only, `isBot`, lowercased labels, body cap); release mapping (drafts dropped); 404 and `[]` for PRs, releases, and specs are empty results, not partial failures; spec selection (4-level paths found, requirements/design priority, path-ordered ties, cap of 6, > 1 MB skipped, invalid paths rejected, segments encoded); spec step recorded when tree fails; timeout and rate-limit paths.
+- **`tests/analyzer.test.ts`** — URL validation; metadata step as the `repo_not_found` source; commit subject/body mapping; PR mapping (merged-only, `isBot`, lowercased labels, body cap); release mapping (drafts dropped); 404 and `[]` for PRs, releases, and specs are empty results, not partial failures; spec selection (4-level paths found, requirements/design priority, path-ordered ties, cap of 6, > 1 MB skipped, invalid paths rejected, segments encoded); spec step recorded when tree fails; timeout and rate-limit paths; `parents`/`mergeCommitSha` mapping; `fetchSelectedPrCommits`: no request for `[]`, ≤ N requests for N numbers, cap of 3, duplicates fetched once, non-integer numbers dropped, per-PR failure (timeout, 500, 429, malformed, redirect) omitted without throwing, host and URL shape asserted.
 - **`tests/storyboard.test.ts`** — per-section extraction and README → spec fallback for capabilities, how-it-works, and features; overview paragraph skips badges and headings and truncates at `introMaxWords`; "Usage" never feeds capabilities; overlap omission at, above, and below the ratio; described vs. name-only features and the summary slide under the cap; anchor tokenization, `GENERIC_TERMS` exclusion, and prefix matching; Significant_PR filters and category precedence; ranking; patch-release detection; timeline minimum, cap, and chronology; deep-dive exclusion of Bug Fix; release deep dives only when PR deep dives fall short; commit fallback, PR-reference dedup, and bug-fix exclusion; empty-anchor fallback (`feat:`/`feat(scope)!:` accepted; `fix:`, `docs:`, `chore:`, `feat(deps):`, `Add …`, and substring-only matches rejected; `maxFallbackHighlights` ceiling; no timeline from commits); history-invariance of current-state slides (Property 14); Change_Context stripping (comments, checklists, headings, trailers, code fences); ordering (Property 3); ceiling metamorphic tests (Property 9); anchoring (Property 10); escaping for every slide type (Property 11); existing run-slide tests with the new position.
 - **`tests/renderer.test.ts`** — `wrapText` with a fake `measure` (explicit breaks, blank lines, long-word breaking, exact-fit lines); `fitLines` ellipsis behaviour; title max lines; existing duration, abort, and sweep tests unchanged.
-- **`tests/routes.test.ts`** — unchanged.
+- **`tests/routes.test.ts`** — target-duration validation; render SSE sink: exactly one terminal `percent: 100` event with `jobId`, no writes after completion, error, or client disconnect.
+- **`tests/progress.test.ts`** — `ProgressTracker` and `VideoRenderer.start` under `vi.useFakeTimers()`, with `fluent-ffmpeg` mocked as a scripted event emitter. Covers: the cadence bound for no reports, a single report, reports just before the boundary, bursts, and a long silent encode; events during frame preparation; monotonic values; ≤ 99 before completion; timers cleared on success, ffmpeg error, and frame-write error (`vi.getTimerCount() === 0`). No wall-clock sleeps.
+- **Change_Group tests (in `tests/storyboard.test.ts`)** — `buildChangeGroups` for merge-commit, squash, rebase-tip, nested-merge, missing-`mergeCommitSha`, PR-data-unavailable, and truncated-window histories; `prsNeedingEvidence` returns only truncated merge-commit Selected_PRs (never squash, rebase, or graph-proven merges); evidence excludes matching window commits, evidence SHAs outside the window and evidence for non-selected PRs are ignored, missing evidence equals graph-only output, and selection is independent of evidence (first-parent walk leaves the window → merge commit only; branch commit reachable only through an out-of-window commit → not grouped; root commit → walk still complete); Property 15 on a fixture that mirrors this repository's PR #9 history; message-rewrite invariance; timeline + deep dive for the same PR allowed; fallback path also limited to one highlight per group.
 
 ### Integration Tests
 
@@ -615,7 +735,8 @@ kiro-repo-visualizer/
 │   │   ├── index.ts               # Express app entry point
 │   │   ├── routes.ts              # Route definitions and top-level error handler
 │   │   ├── cache.ts               # Analysis TTL cache
-│   │   ├── analyzer.ts            # RepositoryAnalyzer (7 extraction steps)
+│   │   ├── analyzer.ts            # RepositoryAnalyzer (7 extraction steps + selected-PR lookup)
+│   │   ├── pipeline.ts            # Storyboard pipeline: analysis → selection → lookup → generation
 │   │   ├── storyboard.ts          # StoryboardGenerator (5 stages)
 │   │   └── renderer.ts            # VideoRenderer (canvas + ffmpeg, text layout)
 │   ├── components/
