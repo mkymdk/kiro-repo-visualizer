@@ -32,11 +32,15 @@ import {
   isPatchRelease,
   selectHighlightCommits,
   buildEvolutionSlides,
+  buildChangeGroups,
+  walkWindow,
+  selectDeepDivePullRequests,
+  prsNeedingEvidence,
   generateStoryboard,
   KeyFeature,
 } from "../src/server/storyboard.js";
 import { SLIDE_CONFIG } from "../src/config/output.js";
-import type { RepoAnalysisResult, Slide, SlideType, SpecDocument } from "../src/types/index.js";
+import type { Commit, PullRequest, RepoAnalysisResult, Slide, SlideType, SpecDocument } from "../src/types/index.js";
 import {
   ALL_FIXTURES,
   HOSTILE,
@@ -604,26 +608,36 @@ describe("buildEvolutionSlides", () => {
   });
 });
 
+/** Select highlights with groups built from the given commits (and PRs). */
+function sel(commits: Commit[], anchors: ReadonlySet<string>, blocked: ReadonlySet<string> = new Set(), prs: PullRequest[] = []) {
+  return selectHighlightCommits(commits, anchors, buildChangeGroups(commits, prs), blocked);
+}
+
 describe("selectHighlightCommits", () => {
   const anchors = new Set(["export"]);
 
-  it("relevant path: keyword + relevant + not Bug Fix + not a presented PR, in commit order", () => {
-    const picked = selectHighlightCommits(
+  it("relevant path: keyword + relevant + not Bug Fix + not blocked + not a merge commit, in commit order", () => {
+    const picked = sel(
       [
-        commit("feat: export pdf (#4)", "2024-01-05"),
-        commit("fix: export crash", "2024-01-04"),
-        commit("feat: telemetry", "2024-01-03"),
-        commit("refactor: exporter", "2024-01-02"),
-        commit("Merge pull request #7 from x/export", "2024-01-01"),
+        commit("feat: export pdf (#4)", "2024-01-05", "", "a5", ["a4"]),
+        commit("fix: export crash", "2024-01-04", "", "a4", ["a3"]),
+        commit("feat: telemetry", "2024-01-03", "", "a3", ["a2"]),
+        commit("refactor: exporter", "2024-01-02", "", "a2", ["a1"]),
+        commit("feat: export merge wrapper", "2024-01-01", "", "a1", ["x", "y"]),
       ],
       anchors,
-      new Set([4, 7]),
+      new Set(["a5"]),
     );
     expect(picked.map((p) => p.commit.subject)).toEqual(["refactor: exporter"]);
   });
 
+  it("does not use subject text: a (#N) suffix alone never excludes a commit", () => {
+    const picked = sel([commit("feat: export pdf (#4)", "t", "", "s1")], anchors, new Set());
+    expect(picked).toHaveLength(1);
+  });
+
   it("uses the commit body's Change_Context when present", () => {
-    const [h] = selectHighlightCommits([commit("feat: export", "t", "Adds export.\n\nSigned-off-by: x")], anchors, new Set());
+    const [h] = sel([commit("feat: export", "t", "Adds export.\n\nSigned-off-by: x")], anchors);
     expect(h?.context).toBe("Adds export.");
   });
 
@@ -631,7 +645,7 @@ describe("selectHighlightCommits", () => {
     const none = new Set<string>();
 
     it("accepts only conventional feat commits, most recent first, capped", () => {
-      const picked = selectHighlightCommits(thinRepo.commits, none, new Set());
+      const picked = sel(thinRepo.commits, none);
       expect(picked.map((p) => p.commit.subject)).toEqual(["feat!: drop node 14", "feat(cli): support --verbose flag"]);
       expect(picked.length).toBeLessThanOrEqual(SLIDE_CONFIG.maxFallbackHighlights);
     });
@@ -648,15 +662,27 @@ describe("selectHighlightCommits", () => {
       "perf: faster",
       "feature: not conventional",
     ])("rejects %j", (subject) => {
-      expect(selectHighlightCommits([commit(subject, "2024-01-01")], none, new Set())).toEqual([]);
+      expect(sel([commit(subject, "2024-01-01")], none)).toEqual([]);
     });
 
     it.each(["feat: a", "feat(scope): a", "feat!: a", "feat(scope)!: a", "FEAT: a"])("accepts %j", (subject) => {
-      expect(selectHighlightCommits([commit(subject, "2024-01-01")], none, new Set())).toHaveLength(1);
+      expect(sel([commit(subject, "2024-01-01")], none)).toHaveLength(1);
     });
 
-    it("excludes feat commits that reference a presented PR", () => {
-      expect(selectHighlightCommits([commit("feat: a (#3)", "t")], none, new Set([3]))).toEqual([]);
+    it("excludes feat commits that belong to a Selected_PR (blocked), and merge commits", () => {
+      expect(sel([commit("feat: a (#3)", "t", "", "s3")], none, new Set(["s3"]))).toEqual([]);
+      expect(sel([commit("feat: merge", "t", "", "m", ["p", "q"])], none)).toEqual([]);
+    });
+
+    it("selects at most one fallback highlight per Change_Group; the cap counts after the group rule", () => {
+      // M merges branch b2←b1 onto base r; both branch commits are feat:, one group.
+      const commits = [
+        commit("Merge pull request #5", "2024-01-05", "", "M", ["r", "b2"]),
+        commit("feat: two", "2024-01-04", "", "b2", ["b1"]),
+        commit("feat: one", "2024-01-03", "", "b1", ["r"]),
+        commit("feat: base", "2024-01-02", "", "r", []),
+      ];
+      expect(sel(commits, none).map((p) => p.commit.sha)).toEqual(["b2", "r"]);
     });
 
     it("produces no timeline or deep dives from commits and stays within the evolution budget", () => {
@@ -849,5 +875,246 @@ describe("Property 11: extracted text is escaped for every slide type", () => {
       }
     }
     expect(all.some((s) => decode(s.body).includes(HOSTILE))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Change_Groups and selected-PR evidence (Req 7.15–7.18, Property 15)
+// ---------------------------------------------------------------------------
+
+const DEDUP_README = [
+  "# viz",
+  "",
+  "Turns repositories into videos.",
+  "",
+  "## Features",
+  "",
+  "- **Storyboard generation** — Builds slides.",
+  "- **Video duration** — Pick a length.",
+  "- **Exporter** — Writes files.",
+].join("\n");
+
+/** History shaped like this repository's PR #9: a merge commit plus three branch commits. */
+function pr9History(): RepoAnalysisResult {
+  const commits = [
+    commit("Merge pull request #9 from x/feature/repository-focused-storyboard", "2026-10-01T00:00:00Z", "", "M9", ["r0", "f3"]),
+    commit("docs: fix run slide requirement reference", "2026-10-01T00:00:00Z", "", "f3", ["f2"]),
+    commit("feat: add configurable target video duration", "2026-09-30T00:00:00Z", "Lets users pick a video duration.", "f2", ["f1"]),
+    commit("feat: add repository-focused storyboard generation", "2026-09-30T00:00:00Z", "Restructures the storyboard.", "f1", ["r0"]),
+    commit("Lesson 1-7", "2026-09-27T00:00:00Z", "", "r0", []),
+  ];
+  return makeResult({
+    readmeText: DEDUP_README,
+    commits,
+    pullRequests: [pr(9, "Feature/repository focused storyboard", "2026-10-01T00:00:00Z", { mergeCommitSha: "M9" })],
+  });
+}
+
+/** Merge-commit PR whose first-parent ancestry leaves the window (long-history shape). */
+function truncatedHistory(): RepoAnalysisResult {
+  const commits = [
+    commit("Merge pull request #42 from x/exporter", "2024-05-03T00:00:00Z", "", "M42", ["OUT1", "b2"]),
+    commit("feat: exporter streams rows", "2024-05-02T00:00:00Z", "", "b2", ["b1"]),
+    commit("feat: exporter writes headers", "2024-05-01T00:00:00Z", "", "b1", ["OUT2"]),
+  ];
+  return makeResult({
+    readmeText: DEDUP_README,
+    commits,
+    pullRequests: [pr(42, "feat: exporter rewrite", "2024-05-03T00:00:00Z", { mergeCommitSha: "M42" })],
+  });
+}
+
+const detailed = (slides: Slide[]): Slide[] => slides.filter((s) => s.type === "change" || s.type === "highlight");
+const highlightTitles = (slides: Slide[]): string[] =>
+  slides.filter((s) => s.type === "highlight").map((s) => decode(s.title));
+
+describe("walkWindow", () => {
+  const idx = new Map<string, string[]>([["a", ["b"]], ["b", []], ["c", ["OUT"]]]);
+
+  it("is complete when it ends at a root", () => {
+    expect(walkWindow("a", idx)).toEqual({ reached: new Set(["a", "b"]), complete: true });
+  });
+
+  it("is incomplete when it meets a parent outside the window, without inferring past it", () => {
+    expect(walkWindow("c", idx)).toEqual({ reached: new Set(["c"]), complete: false });
+    expect(walkWindow("OUT", idx)).toEqual({ reached: new Set(), complete: false });
+  });
+});
+
+describe("buildChangeGroups (Stage 3b, Req 7.17)", () => {
+  it("merge commit with in-window ancestry: merge + every provable branch commit (PR #9 shape)", () => {
+    const r = pr9History();
+    const g = buildChangeGroups(r.commits, r.pullRequests);
+    expect(g.prMembers.get(9)).toEqual(new Set(["M9", "f1", "f2", "f3"]));
+    for (const sha of ["f1", "f2", "f3"]) expect(g.groupOf.get(sha)).toBe("M9");
+    expect(g.groupOf.get("r0")).toBe("r0");
+    expect(g.truncatedMerges.size).toBe(0);
+  });
+
+  it("merge commit whose first-parent ancestry leaves the window: merge commit only", () => {
+    const r = truncatedHistory();
+    const g = buildChangeGroups(r.commits, r.pullRequests);
+    expect(g.truncatedMerges).toEqual(new Set(["M42"]));
+    expect(g.prMembers.get(42)).toEqual(new Set(["M42"]));
+    expect(g.groupOf.get("b1")).toBe("b1");
+    expect(g.groupOf.get("b2")).toBe("b2");
+  });
+
+  it("squash: the PR's single-parent merge commit alone", () => {
+    const commits = [commit("Add exporter (#7)", "t", "", "s7", ["s6"]), commit("prior", "t", "", "s6", [])];
+    const g = buildChangeGroups(commits, [pr(7, "Add exporter", "t", { mergeCommitSha: "s7" })]);
+    expect(g.prMembers.get(7)).toEqual(new Set(["s7"]));
+    expect(g.mergeCommits.size).toBe(0);
+  });
+
+  it("rebase: only the tip is linked; earlier rebased commits stay independent (Req 7.18)", () => {
+    const commits = [
+      commit("feat: exporter part 3", "t", "", "r3", ["r2"]),
+      commit("feat: exporter part 2", "t", "", "r2", ["r1"]),
+      commit("feat: exporter part 1", "t", "", "r1", []),
+    ];
+    const g = buildChangeGroups(commits, [pr(8, "Exporter", "t", { mergeCommitSha: "r3" })]);
+    expect(g.prMembers.get(8)).toEqual(new Set(["r3"]));
+    expect(new Set([g.groupOf.get("r1"), g.groupOf.get("r2"), g.groupOf.get("r3")]).size).toBe(3);
+  });
+
+  it("nested merges: every commit belongs to exactly one group, the outer merge claims first", () => {
+    // Outer M2 merges branch [M1 ← (b ← r), a] ; inner M1 merged b into a.
+    const commits = [
+      commit("outer", "t", "", "M2", ["r", "M1"]),
+      commit("inner", "t", "", "M1", ["a", "b"]),
+      commit("b", "t", "", "b", ["r"]),
+      commit("a", "t", "", "a", ["r"]),
+      commit("root", "t", "", "r", []),
+    ];
+    const g = buildChangeGroups(commits, []);
+    expect(g.groupOf.get("M2")).toBe("M2");
+    for (const sha of ["M1", "a", "b"]) expect(g.groupOf.get(sha)).toBe("M2");
+    expect(g.groupOf.get("r")).toBe("r");
+    expect(g.groupOf.size).toBe(commits.length);
+  });
+
+  it("does not group a branch commit reachable only through an out-of-window commit", () => {
+    const commits = [
+      commit("merge", "t", "", "M", ["r", "b2"]),
+      commit("b2", "t", "", "b2", ["X"]),
+      commit("b1", "t", "", "b1", ["r"]),
+      commit("root", "t", "", "r", []),
+    ];
+    const g = buildChangeGroups(commits, []);
+    expect(g.groupOf.get("b2")).toBe("M");
+    expect(g.groupOf.get("b1")).toBe("b1");
+  });
+
+  it("PR data unavailable: groups come from merge commits alone", () => {
+    const r = pr9History();
+    const g = buildChangeGroups(r.commits, []);
+    expect(g.groupOf.get("f1")).toBe("M9");
+    expect(g.prMembers.size).toBe(0);
+  });
+
+  it("mergeCommitSha null or outside the window: the PR has no known group", () => {
+    const r = pr9History();
+    const prs = [pr(1, "x", "t", { mergeCommitSha: null }), pr(2, "y", "t", { mergeCommitSha: "NOT_IN_WINDOW" })];
+    const g = buildChangeGroups(r.commits, prs);
+    expect(g.prMembers.has(1)).toBe(false);
+    expect(g.prMembers.has(2)).toBe(false);
+  });
+});
+
+describe("Selected_PRs and the lookup filter (Req 2.11, 7.15)", () => {
+  it("prsNeedingEvidence keeps only truncated merge-commit Selected_PRs", () => {
+    const t = truncatedHistory();
+    expect(selectDeepDivePullRequests(t)).toEqual([42]);
+    expect(prsNeedingEvidence(t, [42])).toEqual([42]);
+  });
+
+  it("needs no lookup for graph-proven merges, squash, rebase, unknown merge commits, or unselected PRs", () => {
+    const p9 = pr9History();
+    expect(selectDeepDivePullRequests(p9)).toEqual([9]);
+    expect(prsNeedingEvidence(p9, [9])).toEqual([]);
+
+    const squash = makeResult({
+      readmeText: DEDUP_README,
+      commits: [commit("feat: exporter (#7)", "t", "", "s7", ["OUT"])],
+      pullRequests: [pr(7, "feat: exporter", "t", { mergeCommitSha: "s7" })],
+    });
+    expect(prsNeedingEvidence(squash, selectDeepDivePullRequests(squash))).toEqual([]);
+
+    const unknown = makeResult({ readmeText: DEDUP_README, pullRequests: [pr(3, "feat: exporter", "t")] });
+    expect(prsNeedingEvidence(unknown, selectDeepDivePullRequests(unknown))).toEqual([]);
+
+    expect(prsNeedingEvidence(truncatedHistory(), [])).toEqual([]);
+  });
+});
+
+describe("Property 15: one logical change, at most one detailed slot", () => {
+  it("PR #9 shape: exactly one detailed slide for PR #9 and no highlight for its commits", () => {
+    const slides = generateStoryboard(pr9History());
+    expect(detailed(slides).map((s) => decode(s.title))).toEqual([
+      "Feature · Feature/repository focused storyboard (#9)",
+    ]);
+  });
+
+  it("truncated merge-commit PR: graph-only falls back to independent commits; evidence suppresses them", () => {
+    const t = truncatedHistory();
+    expect(highlightTitles(generateStoryboard(t))).toEqual([
+      "Feature · feat: exporter streams rows",
+      "Feature · feat: exporter writes headers",
+    ]);
+    const withEvidence = generateStoryboard(t, { 42: ["b1", "b2", "c0ffee-not-on-base"] });
+    expect(highlightTitles(withEvidence)).toEqual([]);
+    expect(detailed(withEvidence).map((s) => decode(s.title))).toEqual(["Feature · feat: exporter rewrite (#42)"]);
+  });
+
+  it("evidence never changes which PRs are selected, and empty evidence equals graph-only output", () => {
+    const t = truncatedHistory();
+    const changes = (x: Slide[]): string[] => x.filter((s) => s.type === "change").map((s) => s.title);
+    expect(changes(generateStoryboard(t, { 42: ["b1", "b2"] }))).toEqual(changes(generateStoryboard(t)));
+    expect(strip(generateStoryboard(t, {}))).toEqual(strip(generateStoryboard(t)));
+  });
+
+  it("ignores evidence for PRs that are not selected", () => {
+    const t = truncatedHistory();
+    expect(highlightTitles(generateStoryboard(t, { 999: ["b1", "b2"] }))).toHaveLength(2);
+  });
+
+  it("allows the same PR on the timeline and as a deep dive", () => {
+    const r = { ...pr9History(), releases: [release("v1.0.0", "2026-09-28T00:00:00Z")] };
+    const slides = generateStoryboard(r);
+    expect(decode(slides.find((s) => s.type === "evolution")!.body)).toContain("Feature/repository focused storyboard");
+    expect(detailed(slides).map((s) => decode(s.title))).toEqual([
+      "Feature · Feature/repository focused storyboard (#9)",
+    ]);
+  });
+
+  it("group assignment is unchanged when every commit subject and PR title is rewritten", () => {
+    for (const r of [pr9History(), truncatedHistory()]) {
+      const rewritten = {
+        commits: r.commits.map((c) => ({ ...c, subject: `zz ${c.sha}`, message: `zz ${c.sha}` })),
+        pullRequests: r.pullRequests.map((p) => ({ ...p, title: `zz ${p.number}` })),
+      };
+      const a = buildChangeGroups(r.commits, r.pullRequests);
+      const b = buildChangeGroups(rewritten.commits, rewritten.pullRequests);
+      expect(b.groupOf).toEqual(a.groupOf);
+      expect(b.prMembers).toEqual(a.prMembers);
+    }
+  });
+
+  it("window soundness: unknown out-of-window ancestry never adds members", () => {
+    const r = pr9History();
+    const base = buildChangeGroups(r.commits, r.pullRequests).prMembers.get(9)!;
+    const cut = r.commits.map((c) => (c.sha === "r0" ? { ...c, parents: ["OUTSIDE"] } : c));
+    const after = buildChangeGroups(cut, r.pullRequests).prMembers.get(9)!;
+    for (const sha of after) expect(base.has(sha)).toBe(true);
+    expect(after).toEqual(new Set(["M9"]));
+  });
+
+  it("never selects a merge commit and selects at most one highlight per group (relevant path)", () => {
+    const r = pr9History();
+    const g = buildChangeGroups(r.commits, []);
+    const picked = selectHighlightCommits(r.commits, new Set(["storyboard", "duration"]), g, new Set());
+    expect(picked.map((p) => p.commit.sha)).toHaveLength(1);
+    expect(picked.some((p) => g.mergeCommits.has(p.commit.sha))).toBe(false);
   });
 });

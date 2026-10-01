@@ -33,7 +33,7 @@ npm run dev
 
 | Variable | Required | Description |
 |---|---|---|
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | Optional | GitHub PAT for authenticated API calls. Without it the unauthenticated rate limit of 60 req/hr applies. Create one at https://github.com/settings/tokens — no scopes needed for public repos. |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | Optional | GitHub PAT for authenticated API calls. Without it the unauthenticated rate limit of 60 req/hr applies. An uncached analysis makes at most 15 requests: up to 12 for analysis, plus up to 3 commit lookups made only for merge-commit PRs selected for deep-dive slides whose branch commits can't be proven from the fetched history. Cached storyboards make none. Create one at https://github.com/settings/tokens — no scopes needed for public repos. |
 
 ---
 

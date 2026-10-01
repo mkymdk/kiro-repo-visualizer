@@ -10,19 +10,27 @@
 
 import type { Commit, PullRequest, Release, RepoAnalysisResult } from "../../src/types/index.js";
 
-/** Build a commit fixture; `subject` doubles as `message`. */
-export function commit(subject: string, timestamp: string, body = "", sha = subject): Commit {
-  return { sha, author: "Dev", timestamp, subject, body, message: subject };
+/** Build a commit fixture; `subject` doubles as `message`. `parents` defaults to `[]` (a root). */
+export function commit(subject: string, timestamp: string, body = "", sha = subject, parents: string[] = []): Commit {
+  return { sha, author: "Dev", timestamp, subject, body, message: subject, parents };
 }
 
-/** Build a merged pull request fixture. */
+/** Build a merged pull request fixture. `mergeCommitSha` defaults to `null` (unknown). */
 export function pr(
   number: number,
   title: string,
   mergedAt: string,
-  opts: Partial<Pick<PullRequest, "body" | "labels" | "isBot">> = {},
+  opts: Partial<Pick<PullRequest, "body" | "labels" | "isBot" | "mergeCommitSha">> = {},
 ): PullRequest {
-  return { number, title, mergedAt, body: opts.body ?? "", labels: opts.labels ?? [], isBot: opts.isBot ?? false };
+  return {
+    number,
+    title,
+    mergedAt,
+    body: opts.body ?? "",
+    labels: opts.labels ?? [],
+    isBot: opts.isBot ?? false,
+    mergeCommitSha: opts.mergeCommitSha ?? null,
+  };
 }
 
 /** Build a release fixture. */

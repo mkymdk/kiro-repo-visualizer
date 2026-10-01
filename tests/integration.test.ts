@@ -88,6 +88,7 @@ const VALID_RESULT: RepoAnalysisResult = {
       subject: "feat: add feature",
       body: "",
       message: "feat: add feature",
+      parents: [],
     },
   ],
   specDocs: [],

@@ -27,6 +27,8 @@ export interface Commit {
   body: string;
   /** Alias of `subject`, retained for existing callers. */
   message: string;
+  /** Parent commit SHAs from the commits response; two or more marks a Merge_Commit. */
+  parents: string[];
 }
 
 /** A merged pull request fetched from the GitHub pulls API. */
@@ -43,7 +45,16 @@ export interface PullRequest {
   mergedAt: string;
   /** True when the author account is a bot. */
   isBot: boolean;
+  /** `merge_commit_sha` from the pulls response, or null when GitHub provides none. */
+  mergeCommitSha: string | null;
 }
+
+/**
+ * PR_Commit_Evidence: commit SHAs exactly as GitHub returned them for each
+ * Selected_PR, keyed by PR number. Only Selected_PRs that needed a lookup
+ * appear; a failed lookup is simply absent.
+ */
+export type PrCommitEvidence = Record<number, string[]>;
 
 /** A published, non-draft GitHub release. */
 export interface Release {
@@ -118,6 +129,12 @@ export interface RepoAnalysisResult {
   pullRequests: PullRequest[];
   /** Published, non-draft releases among the 10 most recent. */
   releases: Release[];
+  /**
+   * Selected-PR commit evidence, set by the storyboard pipeline after its
+   * lazy lookup and kept with the cached analysis so a cache hit makes no
+   * further requests. Absent until the pipeline has run for this analysis.
+   */
+  prCommitEvidence?: PrCommitEvidence;
   /**
    * Names of extraction steps that were skipped due to non-fatal errors.
    * An empty array means all steps succeeded.

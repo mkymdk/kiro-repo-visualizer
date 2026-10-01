@@ -19,6 +19,7 @@ import {
   ChangeCategory,
   Commit,
   DirectoryNode,
+  PrCommitEvidence,
   PullRequest,
   Release,
   RepoAnalysisResult,
@@ -967,13 +968,107 @@ function releaseTitle(release: Release): string {
   return release.name?.trim() || release.tagName;
 }
 
-/** PR numbers referenced by a commit subject (`(#N)` or `Merge pull request #N`). */
-function referencedPullRequests(subject: string): number[] {
-  const refs: number[] = [];
-  for (const m of subject.matchAll(/\(#(\d+)\)/g)) refs.push(Number(m[1]));
-  const merge = /^Merge pull request #(\d+)/i.exec(subject);
-  if (merge) refs.push(Number(merge[1]));
-  return refs;
+// ---------------------------------------------------------------------------
+// Act 6 — How has it evolved? (Change_Groups, Req 7.15–7.18)
+// ---------------------------------------------------------------------------
+
+/** Result of walking parent links inside the fetched commit window. */
+export interface WindowWalk {
+  /** Window commits reached, including the start commit. */
+  reached: Set<string>;
+  /** False when the walk met a parent SHA outside the window (or started outside it). */
+  complete: boolean;
+}
+
+/**
+ * Walk parent links through commits in the window only.
+ *
+ * @param start - SHA to start from.
+ * @param parentsOf - Window index `sha → parents`.
+ * @returns The reached window commits and whether the ancestry was fully inside the window.
+ */
+export function walkWindow(start: string, parentsOf: ReadonlyMap<string, string[]>): WindowWalk {
+  const reached = new Set<string>();
+  let complete = true;
+  const stack = [start];
+  while (stack.length > 0) {
+    const sha = stack.pop()!;
+    if (reached.has(sha)) continue;
+    const parents = parentsOf.get(sha);
+    if (parents === undefined) {
+      complete = false;
+      continue;
+    }
+    reached.add(sha);
+    stack.push(...parents);
+  }
+  return { reached, complete };
+}
+
+/** Change_Groups and PR membership derived from the commit graph alone. */
+export interface ChangeGroups {
+  /** Partition of every window commit into a group id (one group per commit). */
+  groupOf: Map<string, string>;
+  /** Window commits with two or more parents. */
+  mergeCommits: Set<string>;
+  /** Merge commits whose first-parent ancestry leaves the window. */
+  truncatedMerges: Set<string>;
+  /** Graph-proven member commits per PR number (PRs with a known merge commit only). */
+  prMembers: Map<number, Set<string>>;
+}
+
+/**
+ * Build Change_Groups from commit parents and PR merge commits (design Stage 3b).
+ *
+ * Never reads commit messages, dates, or listing order. A merge commit's group
+ * contains its branch commits only when its first-parent ancestry is fully
+ * inside the window; otherwise it contains the merge commit alone. Nested
+ * merges are processed descendants-first, using reachable-commit counts
+ * (a descendant always reaches strictly more), with SHA as a deterministic
+ * tie-break; a commit keeps its first assignment.
+ *
+ * @param commits - The fetched commit window.
+ * @param pullRequests - Merged pull requests.
+ * @returns The {@link ChangeGroups}.
+ */
+export function buildChangeGroups(commits: Commit[], pullRequests: PullRequest[]): ChangeGroups {
+  const parentsOf = new Map(commits.map((c) => [c.sha, c.parents]));
+  const mergeCommits = new Set(commits.filter((c) => c.parents.length >= 2).map((c) => c.sha));
+  const truncatedMerges = new Set<string>();
+  const ownMembers = new Map<string, Set<string>>();
+
+  for (const m of mergeCommits) {
+    const parents = parentsOf.get(m)!;
+    const first = walkWindow(parents[0]!, parentsOf);
+    const members = new Set<string>([m]);
+    if (first.complete) {
+      for (const sha of walkWindow(parents[1]!, parentsOf).reached) {
+        if (!first.reached.has(sha)) members.add(sha);
+      }
+    } else {
+      truncatedMerges.add(m);
+    }
+    ownMembers.set(m, members);
+  }
+
+  const reachCount = new Map([...mergeCommits].map((m) => [m, walkWindow(m, parentsOf).reached.size]));
+  const order = [...mergeCommits].sort(
+    (a, b) => reachCount.get(b)! - reachCount.get(a)! || (a < b ? -1 : a > b ? 1 : 0),
+  );
+  const groupOf = new Map<string, string>();
+  for (const m of order) {
+    if (groupOf.has(m)) continue;
+    for (const sha of ownMembers.get(m)!) if (!groupOf.has(sha)) groupOf.set(sha, m);
+  }
+  for (const c of commits) if (!groupOf.has(c.sha)) groupOf.set(c.sha, c.sha);
+
+  const prMembers = new Map<number, Set<string>>();
+  for (const pr of pullRequests) {
+    const sha = pr.mergeCommitSha;
+    if (!sha || !parentsOf.has(sha)) continue;
+    prMembers.set(pr.number, ownMembers.get(sha) ?? new Set([sha]));
+  }
+  return { groupOf, mergeCommits, truncatedMerges, prMembers };
 }
 
 /** Conventional `feat` type, the only commits allowed in the empty-anchor fallback. */
@@ -985,46 +1080,61 @@ const HIGHLIGHT_RE = /feat|fix|refactor|add|implement|redesign/i;
 /**
  * Select Engineering_Highlight commits.
  *
- * With Anchor_Terms: keyword match, category ≠ Bug Fix, relevant, not a
- * presented-PR reference, up to `SLIDE_CONFIG.maxHighlights`, commit order
- * (Req 7.9). Without Anchor_Terms: only conventional `feat` commits without
- * dependency wording, most recent first, up to
- * `SLIDE_CONFIG.maxFallbackHighlights` (Req 7.14).
+ * With Anchor_Terms: keyword match, category ≠ Bug Fix, relevant, up to
+ * `SLIDE_CONFIG.maxHighlights`, commit order (Req 7.9). Without Anchor_Terms:
+ * only conventional `feat` commits without dependency wording, most recent
+ * first, up to `SLIDE_CONFIG.maxFallbackHighlights` (Req 7.14).
+ * On both paths (Req 7.15): merge commits and `blocked` commits are never
+ * candidates, and at most one commit per Change_Group is selected; the
+ * fallback cap counts after this rule.
  *
  * @param commits - Commit history.
  * @param anchors - Anchor_Term set.
- * @param presentedPrNumbers - PR numbers already shown in the storyboard.
+ * @param groups - Change_Groups from {@link buildChangeGroups}.
+ * @param blocked - Commits belonging to Selected_PRs (graph members and exact evidence).
  * @returns Selected commits with their category and context.
  */
 export function selectHighlightCommits(
   commits: Commit[],
   anchors: ReadonlySet<string>,
-  presentedPrNumbers: ReadonlySet<number>,
+  groups: ChangeGroups,
+  blocked: ReadonlySet<string>,
 ): { commit: Commit; category: ChangeCategory; context: string | null }[] {
-  const notPresented = (c: Commit): boolean =>
-    !referencedPullRequests(c.subject).some((n) => presentedPrNumbers.has(n));
+  const usedGroups = new Set<string>();
+  const take = (c: Commit): boolean => {
+    if (groups.mergeCommits.has(c.sha) || blocked.has(c.sha)) return false;
+    const g = groups.groupOf.get(c.sha) ?? c.sha;
+    if (usedGroups.has(g)) return false;
+    usedGroups.add(g);
+    return true;
+  };
 
   if (anchors.size === 0) {
-    return [...commits]
+    const out: { commit: Commit; category: ChangeCategory; context: string | null }[] = [];
+    const ordered = [...commits]
       .filter((c) => FEAT_COMMIT_RE.test(c.subject))
       .filter((c) => !DEPENDENCY_WORD_RE.test(c.subject))
-      .filter(notPresented)
-      .sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0))
-      .slice(0, SLIDE_CONFIG.maxFallbackHighlights)
-      .map((commit) => ({
+      .sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
+    for (const commit of ordered) {
+      if (out.length >= SLIDE_CONFIG.maxFallbackHighlights) break;
+      if (!take(commit)) continue;
+      out.push({
         commit,
         category: categoryFromTitle(commit.subject) ?? "Feature",
         context: extractChangeContext(commit.body),
-      }));
+      });
+    }
+    return out;
   }
 
   const out: { commit: Commit; category: ChangeCategory; context: string | null }[] = [];
   for (const commit of commits) {
-    if (!HIGHLIGHT_RE.test(commit.subject) || !notPresented(commit)) continue;
+    if (!HIGHLIGHT_RE.test(commit.subject)) continue;
     const category = categoryFromTitle(commit.subject);
     if (!category || category === "Bug Fix") continue;
     const context = extractChangeContext(commit.body);
     if (!isRelevant(`${commit.subject} ${context ?? ""}`, anchors)) continue;
+    if (!take(commit)) continue;
     out.push({ commit, category, context });
     if (out.length >= SLIDE_CONFIG.maxHighlights) break;
   }
@@ -1034,6 +1144,90 @@ export function selectHighlightCommits(
 // ---------------------------------------------------------------------------
 // Act 6 — How has it evolved? (allocation)
 // ---------------------------------------------------------------------------
+
+/** One Evolution_Timeline line. */
+interface TimelineEntry {
+  date: string;
+  label: string;
+  title: string;
+}
+
+/** Evidence-independent evolution plan: timeline and Selected_PRs. */
+interface EvolutionPlan {
+  /** Timeline entries (oldest first), empty when below `minEvolutionItems`. */
+  timeline: TimelineEntry[];
+  /** Selected_PRs in rank order (Req 7.5). */
+  deepDives: RankedPullRequest[];
+  /** Non-patch releases, newest first. */
+  milestoneReleases: Release[];
+}
+
+/**
+ * Plan the timeline and choose Selected_PRs. Never reads PR_Commit_Evidence,
+ * so the choice is identical with or without lookup results (Req 7.15).
+ *
+ * @param result - The analysis result.
+ * @param anchors - Anchor_Term set.
+ * @returns The {@link EvolutionPlan}.
+ */
+function planEvolution(result: RepoAnalysisResult, anchors: ReadonlySet<string>): EvolutionPlan {
+  const ranked = rankSignificantPullRequests(result.pullRequests);
+  const relevantPrs = ranked.filter((r) => isRelevant(`${r.pr.title} ${r.context ?? ""}`, anchors));
+  const milestoneReleases = result.releases
+    .filter((r) => !isPatchRelease(r))
+    .sort((a, b) => (a.publishedAt < b.publishedAt ? 1 : a.publishedAt > b.publishedAt ? -1 : 0));
+
+  // Timeline: newest milestone releases first, then top relevant PRs; shown oldest → newest.
+  const entries: TimelineEntry[] = [
+    ...milestoneReleases.map((r): TimelineEntry => ({ date: r.publishedAt, label: "Release", title: releaseTitle(r) })),
+    ...relevantPrs.map((r): TimelineEntry => ({ date: r.pr.mergedAt, label: r.category, title: r.pr.title })),
+  ]
+    .slice(0, SLIDE_CONFIG.maxEvolutionItems)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  const timeline = entries.length >= SLIDE_CONFIG.minEvolutionItems ? entries : [];
+
+  const slots = SLIDE_CONFIG.maxEvolutionSlides - (timeline.length > 0 ? 1 : 0);
+  const deepDives = relevantPrs.filter((x) => x.category !== "Bug Fix").slice(0, Math.max(0, slots));
+  return { timeline, deepDives, milestoneReleases };
+}
+
+/** Anchor_Terms exactly as {@link generateStoryboard} derives them (current-state content only). */
+function anchorsForResult(result: RepoAnalysisResult): Set<string> {
+  const capabilities = extractCapabilities(result.readmeText, result.specDocs);
+  const features = extractKeyFeatures(result.readmeText, result.specDocs);
+  const howItWorks = extractHowItWorks(result.readmeText, result.specDocs);
+  return buildAnchorTerms(capabilities, features.map((f) => f.name), howItWorks?.headings ?? []);
+}
+
+/**
+ * Choose the Selected_PRs (PRs that receive deep-dive slides). Pure and
+ * evidence-independent; used by the storyboard pipeline before any lookup.
+ *
+ * @param result - The analysis result.
+ * @returns Selected PR numbers in rank order.
+ */
+export function selectDeepDivePullRequests(result: RepoAnalysisResult): number[] {
+  return planEvolution(result, anchorsForResult(result)).deepDives.map((r) => r.pr.number);
+}
+
+/**
+ * Keep only Selected_PRs whose membership the graph can't prove: merge-commit
+ * PRs whose merge commit is in the window but whose first-parent ancestry
+ * leaves it. Squash, rebase, graph-proven merges, and PRs with an unknown
+ * merge commit need no lookup (Req 2.11).
+ *
+ * @param result - The analysis result.
+ * @param selected - Selected PR numbers.
+ * @returns PR numbers that need exact evidence.
+ */
+export function prsNeedingEvidence(result: RepoAnalysisResult, selected: number[]): number[] {
+  const groups = buildChangeGroups(result.commits, result.pullRequests);
+  const bySha = new Map(result.pullRequests.map((p) => [p.number, p.mergeCommitSha]));
+  return selected.filter((n) => {
+    const sha = bySha.get(n);
+    return typeof sha === "string" && groups.truncatedMerges.has(sha);
+  });
+}
 
 /**
  * Allocate evolution slides within `SLIDE_CONFIG.maxEvolutionSlides`.
@@ -1047,45 +1241,38 @@ export function selectHighlightCommits(
  * @param anchors - Anchor_Term set derived from current-state content.
  * @returns Evolution slides in storyboard order.
  */
-export function buildEvolutionSlides(result: RepoAnalysisResult, anchors: ReadonlySet<string>): Slide[] {
+export function buildEvolutionSlides(
+  result: RepoAnalysisResult,
+  anchors: ReadonlySet<string>,
+  evidence: PrCommitEvidence = {},
+): Slide[] {
   const slides: Slide[] = [];
+  const plan = planEvolution(result, anchors);
   let remaining = SLIDE_CONFIG.maxEvolutionSlides;
-  const presented = new Set<number>();
 
-  const ranked = rankSignificantPullRequests(result.pullRequests);
-  const relevantPrs = ranked.filter((r) => isRelevant(`${r.pr.title} ${r.context ?? ""}`, anchors));
-  const milestoneReleases = result.releases
-    .filter((r) => !isPatchRelease(r))
-    .sort((a, b) => (a.publishedAt < b.publishedAt ? 1 : a.publishedAt > b.publishedAt ? -1 : 0));
-
-  // Timeline: newest milestone releases first, then top relevant PRs; shown oldest → newest.
-  type Entry = { date: string; label: string; title: string; prNumber?: number };
-  const entries: Entry[] = [
-    ...milestoneReleases.map((r): Entry => ({ date: r.publishedAt, label: "Release", title: releaseTitle(r) })),
-    ...relevantPrs.map((r): Entry => ({ date: r.pr.mergedAt, label: r.category, title: r.pr.title, prNumber: r.pr.number })),
-  ]
-    .slice(0, SLIDE_CONFIG.maxEvolutionItems)
-    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
-
-  if (entries.length >= SLIDE_CONFIG.minEvolutionItems && remaining > 0) {
+  if (plan.timeline.length > 0) {
     slides.push(
       makeSlide(
         "evolution",
         "How it evolved",
-        entries.map((e) => `${isoDate(e.date)} · ${e.label} · ${e.title}`).join("\n"),
+        plan.timeline.map((e) => `${isoDate(e.date)} · ${e.label} · ${e.title}`).join("\n"),
       ),
     );
-    for (const e of entries) if (e.prNumber !== undefined) presented.add(e.prNumber);
     remaining--;
   }
 
-  for (const r of relevantPrs.filter((x) => x.category !== "Bug Fix")) {
-    if (remaining <= 0) break;
+  // Selected_PR deep dives block their graph members and their exact evidence (Req 7.15).
+  const groups = buildChangeGroups(result.commits, result.pullRequests);
+  const windowShas = new Set(result.commits.map((c) => c.sha));
+  const blocked = new Set<string>();
+  for (const r of plan.deepDives) {
     const lines = [...(r.context ? [r.context, ""] : []), `Merged ${isoDate(r.pr.mergedAt)}`];
     slides.push(makeSlide("change", `${r.category} · ${r.pr.title} (#${r.pr.number})`, lines.join("\n")));
-    presented.add(r.pr.number);
+    for (const sha of groups.prMembers.get(r.pr.number) ?? []) blocked.add(sha);
+    for (const sha of evidence[r.pr.number] ?? []) if (windowShas.has(sha)) blocked.add(sha);
     remaining--;
   }
+  const { milestoneReleases } = plan;
 
   for (const release of milestoneReleases) {
     if (remaining <= 0) break;
@@ -1101,7 +1288,7 @@ export function buildEvolutionSlides(result: RepoAnalysisResult, anchors: Readon
     remaining--;
   }
 
-  for (const h of selectHighlightCommits(result.commits, anchors, presented)) {
+  for (const h of selectHighlightCommits(result.commits, anchors, groups, blocked)) {
     if (remaining <= 0) break;
     const lines = [
       ...(h.context ? [h.context, ""] : []),
@@ -1164,11 +1351,14 @@ function trimToMax(slides: Slide[]): Slide[] {
  * the tree; history is used only for evolution slides.
  *
  * @param result - The {@link RepoAnalysisResult} from the analyzer.
+ * @param evidence - Optional PR_Commit_Evidence for Selected_PRs. It only adds
+ *   suppression of duplicate commit highlights; without it the output equals
+ *   graph-only grouping.
  * @returns An ordered array of {@link Slide} objects with UUID `id`s.
  * @throws {@link ApiError} With code `insufficient_content` if fewer than
  *   `SLIDE_CONFIG.minSlides` slides can be generated.
  */
-export function generateStoryboard(result: RepoAnalysisResult): Slide[] {
+export function generateStoryboard(result: RepoAnalysisResult, evidence: PrCommitEvidence = {}): Slide[] {
   const { owner, repo, readmeText, directoryTree, specDocs, metadata } = result;
 
   const capabilities = extractCapabilities(readmeText, specDocs);
@@ -1189,7 +1379,7 @@ export function generateStoryboard(result: RepoAnalysisResult): Slide[] {
   slides.push(buildArchitectureSlide(repo, directoryTree));
   if (howItWorks) slides.push(buildHowItWorksSlide(howItWorks));
   slides.push(...buildFeatureSlides(features));
-  slides.push(...buildEvolutionSlides(result, anchors));
+  slides.push(...buildEvolutionSlides(result, anchors, evidence));
   slides.push(buildConclusionSlide(owner, repo, metadata));
 
   const ordered = slides
