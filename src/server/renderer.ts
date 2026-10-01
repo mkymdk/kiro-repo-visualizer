@@ -391,6 +391,89 @@ export function renderSlideFrames(
 /** Callback type used to report render progress. */
 export type ProgressCallback = (percent: number) => void;
 
+// ---------------------------------------------------------------------------
+// Progress heartbeat (Req 4.3, 4.17, 4.18)
+// ---------------------------------------------------------------------------
+
+/**
+ * Heartbeat interval. Half of the required maximum gap, so one late timer
+ * tick still keeps consecutive events within `VIDEO_CONFIG.progressIntervalMs`.
+ */
+export const HEARTBEAT_MS = VIDEO_CONFIG.progressIntervalMs / 2;
+
+/** Share of the 0–99 progress scale covered by frame preparation; encoding covers the rest. */
+export const FRAME_PHASE_WEIGHT = 0.1;
+
+/** Highest percentage reported before the single terminal 100 event. */
+const MAX_RUNNING_PERCENT = 99;
+
+/**
+ * Holds the current render progress and emits it on a fixed timer.
+ *
+ * `update()` only stores a value; the timer started by `start()` is the sole
+ * emitter, so the cadence never depends on how often ffmpeg reports.
+ */
+export class ProgressTracker {
+  private percent = 0;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private stopped = false;
+
+  /**
+   * Create a tracker.
+   *
+   * @param emit - Receives the current percentage on every heartbeat.
+   */
+  constructor(private readonly emit: ProgressCallback) {}
+
+  /**
+   * Store a new progress estimate without emitting.
+   *
+   * @param fraction - Overall completion in [0, 1]; values are clamped, rounded,
+   *   kept non-decreasing, and capped at 99.
+   */
+  update(fraction: number): void {
+    if (this.stopped || !Number.isFinite(fraction)) return;
+    const next = Math.min(MAX_RUNNING_PERCENT, Math.round(Math.max(0, Math.min(1, fraction)) * 100));
+    if (next > this.percent) this.percent = next;
+  }
+
+  /** The last stored percentage. */
+  get current(): number {
+    return this.percent;
+  }
+
+  /**
+   * Emit the current value now, then every {@link HEARTBEAT_MS}. Idempotent.
+   *
+   * @remarks
+   * Schedules a recurring timer until {@link ProgressTracker.stop} is called.
+   */
+  start(): void {
+    if (this.stopped || this.timer !== null) return;
+    this.tick();
+    this.timer = setInterval(() => this.tick(), HEARTBEAT_MS);
+  }
+
+  /** Clear the timer and turn every later call into a no-op. Idempotent. */
+  stop(): void {
+    this.stopped = true;
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  /** Emit the stored value unless stopped. */
+  private tick(): void {
+    if (!this.stopped) this.emit(this.percent);
+  }
+}
+
+/** Yield to the event loop so timers (the heartbeat) can run. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 /**
  * Singleton-style video renderer that manages render job lifecycle.
  *
@@ -401,16 +484,21 @@ export class VideoRenderer {
   /** In-memory store of all render jobs keyed by job UUID. */
   public readonly jobs: Map<string, RenderJob> = new Map();
 
+  /** Progress trackers of jobs that are still rendering, keyed by job UUID. */
+  private readonly trackers: Map<string, ProgressTracker> = new Map();
+
   /**
    * Start a new video render job for the given slides.
    *
    * Renders each slide to a PNG frame sequence, then pipes the frames to
-   * ffmpeg for H.264/MP4 encoding. Progress callbacks are fired at
-   * `VIDEO_CONFIG.progressIntervalMs` intervals.
+   * ffmpeg for H.264/MP4 encoding. A {@link ProgressTracker} emits progress
+   * every {@link HEARTBEAT_MS} during both phases; ffmpeg reports only update
+   * the stored value. The tracker is stopped on success, failure, and
+   * {@link VideoRenderer.abort}. The terminal 100 event is the caller's.
    *
    * @param slides - The ordered array of {@link Slide} objects to render.
-   * @param onProgress - Callback invoked with a percent value (0–100) as
-   *   encoding proceeds.
+   * @param onProgress - Callback invoked on every heartbeat with a
+   *   non-decreasing percent value in 0–99.
    * @param targetDurationSeconds - Optional target total video duration in
    *   seconds, distributed across the slides. When omitted, a default is
    *   derived from the slide count. Expected to be within
@@ -443,25 +531,28 @@ export class VideoRenderer {
     };
     this.jobs.set(jobId, job);
 
+    const tracker = new ProgressTracker(onProgress);
+    this.trackers.set(jobId, tracker);
+
     try {
       job.status = "rendering";
+      tracker.start();
       const secondsPerSlide = calculateSecondsPerSlide(
         slides.length,
         targetDurationSeconds,
       );
 
-      // Render all frames
+      // Render all frames, yielding after each slide so the heartbeat can fire.
       const allFrames: Buffer[] = [];
-      for (const slide of slides) {
-        allFrames.push(...renderSlideFrames(slide, secondsPerSlide));
+      for (let i = 0; i < slides.length; i++) {
+        allFrames.push(...renderSlideFrames(slides[i]!, secondsPerSlide));
+        tracker.update(((i + 1) / slides.length) * FRAME_PHASE_WEIGHT);
+        await yieldToEventLoop();
       }
 
       const totalFrames = allFrames.length;
 
       await new Promise<void>((resolve, reject) => {
-        let encodedFrames = 0;
-        let lastProgressAt = 0;
-
         const command = Ffmpeg();
 
         // Pipe frames through a PassThrough stream
@@ -482,20 +573,12 @@ export class VideoRenderer {
           ])
           .output(outputPath)
           .on("progress", (progress: { frames?: number }) => {
-            // ffmpeg reports the number of frames it has actually encoded so
-            // far. Use that for real progress rather than how fast we can push
-            // buffers into the input stream. Throttle to the configured
-            // interval so we don't spam SSE events.
-            if (typeof progress.frames === "number") {
-              encodedFrames = progress.frames;
-            }
-            const now = Date.now();
-            if (now - lastProgressAt >= VIDEO_CONFIG.progressIntervalMs) {
-              lastProgressAt = now;
-              const percent = totalFrames > 0
-                ? Math.min(99, Math.round((encodedFrames / totalFrames) * 100))
-                : 0;
-              onProgress(percent);
+            // ffmpeg's encoded-frame count only updates the stored value; the
+            // heartbeat timer alone decides when progress is emitted.
+            if (typeof progress.frames === "number" && totalFrames > 0) {
+              tracker.update(
+                FRAME_PHASE_WEIGHT + (1 - FRAME_PHASE_WEIGHT) * (progress.frames / totalFrames),
+              );
             }
           })
           .on("error", (err: Error) => {
@@ -542,12 +625,16 @@ export class VideoRenderer {
       job.sizeWarning = stat.size > VIDEO_CONFIG.maxFileSizeBytes;
       job.status = "complete";
       job.completedAtMs = Date.now();
-      onProgress(100);
     } catch (err: unknown) {
       job.status = "failed";
       job.errorMessage =
         err instanceof Error ? err.message : "Unknown render error";
       throw new ApiError("internal_error", job.errorMessage);
+    } finally {
+      // Release the heartbeat on success, failure, and cancellation alike.
+      // The route sends the single terminal 100 event (Req 4.17).
+      tracker.stop();
+      this.trackers.delete(jobId);
     }
 
     return job;
@@ -573,6 +660,11 @@ export class VideoRenderer {
     }
 
     job.status = "cancelled";
+
+    // Stop progress reporting for this job (Req 4.18). ffmpeg termination is
+    // unchanged here (follow-up F1).
+    this.trackers.get(jobId)?.stop();
+    this.trackers.delete(jobId);
 
     // Attempt to delete the partial output file
     if (job.outputPath) {

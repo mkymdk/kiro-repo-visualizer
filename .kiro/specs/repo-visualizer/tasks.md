@@ -450,28 +450,28 @@ Branch and commit plan:
 
 ## Tasks
 
-- [ ] 24. Prerequisites and data model
-  - [ ] 24.1 Check `fix/render-sse-double-error-handling` is ready: trial-merge it with current `main` (`git merge-tree`), and in a throwaway worktree of the merge result run type-check, the full test suite, and the production build. Report any conflict or failure and stop if there is one.
-  - [ ] 24.2 Merge that branch into `main` through its pull request (user action, or a local merge pushed to `main` only with explicit approval). Fast-forward local `main` to `origin/main` and run the full existing validation once on it: type-check, tests, build.
-  - [ ] 24.3 Create `fix/evolution-dedup-progress-heartbeat` from the updated `main`. Carry over the uncommitted spec changes (requirements.md, design.md, tasks.md) without touching the merged fix, and commit them as `docs: specify change-group dedup and progress heartbeat`.
-  - [ ] 24.4 In `src/types/index.ts`, add `Commit.parents: string[]`, `PullRequest.mergeCommitSha: string | null`, `PrCommitEvidence = Record<number, string[]>`, and optional `RepoAnalysisResult.prCommitEvidence` for caching, with doc comments.
-  - [ ] 24.5 In `analyzer.ts`, map `parents[].sha` (default `[]`) and `merge_commit_sha` (default `null`) from the existing responses. Steps 1–7 send no new requests and the same URLs.
-  - [ ] 24.6 Update test-data builders (`commit()` defaults `parents: []`, `pr()` defaults `mergeCommitSha: null`) and the cache/integration fixtures. Type-check must be clean.
+- [x] 24. Prerequisites and data model
+  - [x] 24.1 Check `fix/render-sse-double-error-handling` is ready: trial-merge it with current `main` (`git merge-tree`), and in a throwaway worktree of the merge result run type-check, the full test suite, and the production build. Report any conflict or failure and stop if there is one.
+  - [x] 24.2 Merge that branch into `main` through its pull request (user action, or a local merge pushed to `main` only with explicit approval). Fast-forward local `main` to `origin/main` and run the full existing validation once on it: type-check, tests, build.
+  - [x] 24.3 Create `fix/evolution-dedup-progress-heartbeat` from the updated `main`. Carry over the uncommitted spec changes (requirements.md, design.md, tasks.md) without touching the merged fix, and commit them as `docs: specify change-group dedup and progress heartbeat`.
+  - [x] 24.4 In `src/types/index.ts`, add `Commit.parents: string[]`, `PullRequest.mergeCommitSha: string | null`, `PrCommitEvidence = Record<number, string[]>`, and optional `RepoAnalysisResult.prCommitEvidence` for caching, with doc comments.
+  - [x] 24.5 In `analyzer.ts`, map `parents[].sha` (default `[]`) and `merge_commit_sha` (default `null`) from the existing responses. Steps 1–7 send no new requests and the same URLs.
+  - [x] 24.6 Update test-data builders (`commit()` defaults `parents: []`, `pr()` defaults `mergeCommitSha: null`) and the cache/integration fixtures. Type-check must be clean.
 
-- [ ] 25. Change_Group deduplication with selected-PR evidence
-  - [ ] 25.1 `storyboard.ts`: `walk` (window-only, reports `complete`) and `buildChangeGroups` exactly as design.md Stage 3b.
-  - [ ] 25.2 `storyboard.ts`: `selectDeepDivePullRequests(result)` (pure, evidence-independent) and `prsNeedingEvidence(result, selected)` (selected, merge-commit, first-parent walk incomplete; never squash, rebase, graph-proven merges, or unknown merge commits). Both are exported for the pipeline and have no I/O.
-  - [ ] 25.3 `analyzer.ts`: `fetchSelectedPrCommits(owner, repo, prNumbers)`, the lazy step 8. `per_page=100`, one page; at most `MAX_SELECTED_PR_LOOKUPS` (3) requests; duplicates fetched once; non-positive or unsafe integers dropped before any URL is built; host asserted; each lookup isolated so a timeout, non-2xx, 429, malformed body, or redirect omits that PR and never throws.
-  - [ ] 25.4 `storyboard.ts`: `generateStoryboard(result, evidence?)` applies Req 7.15 during evolution allocation on both the relevant path (7.9) and the fallback path (7.14):
+- [x] 25. Change_Group deduplication with selected-PR evidence
+  - [x] 25.1 `storyboard.ts`: `walk` (window-only, reports `complete`) and `buildChangeGroups` exactly as design.md Stage 3b.
+  - [x] 25.2 `storyboard.ts`: `selectDeepDivePullRequests(result)` (pure, evidence-independent) and `prsNeedingEvidence(result, selected)` (selected, merge-commit, first-parent walk incomplete; never squash, rebase, graph-proven merges, or unknown merge commits). Both are exported for the pipeline and have no I/O.
+  - [x] 25.3 `analyzer.ts`: `fetchSelectedPrCommits(owner, repo, prNumbers)`, the lazy step 8. `per_page=100`, one page; at most `MAX_SELECTED_PR_LOOKUPS` (3) requests; duplicates fetched once; non-positive or unsafe integers dropped before any URL is built; host asserted; each lookup isolated so a timeout, non-2xx, 429, malformed body, or redirect omits that PR and never throws.
+  - [x] 25.4 `storyboard.ts`: `generateStoryboard(result, evidence?)` applies Req 7.15 during evolution allocation on both the relevant path (7.9) and the fallback path (7.14):
     - A Selected_PR blocks its graph group plus every window commit whose SHA is in its evidence.
     - Merge commits are never highlight candidates; at most one highlight per group.
     - Timeline entries don't block.
     - Evidence for non-selected PRs and SHAs outside the window are ignored.
 
     Remove `referencedPullRequests` and every subject-based exclusion.
-  - [ ] 25.5 New `src/server/pipeline.ts` with `buildStoryboardForUrl(url)`, owning the workflow from design.md §6a: validate and derive the cache key → cached or fresh analysis → evidence already cached? → `selectDeepDivePullRequests` → `prsNeedingEvidence` → `fetchSelectedPrCommits` → store evidence on the analysis → `generateStoryboard(result, evidence)`.
+  - [x] 25.5 New `src/server/pipeline.ts` with `buildStoryboardForUrl(url)`, owning the workflow from design.md §6a: validate and derive the cache key → cached or fresh analysis → evidence already cached? → `selectDeepDivePullRequests` → `prsNeedingEvidence` → `fetchSelectedPrCommits` → store evidence on the analysis → `generateStoryboard(result, evidence)`.
     `routes.ts` `GET /api/storyboard` becomes a transport-only call to `buildStoryboardForUrl`, with no analyzer, storyboard, or cache calls left in the handler. Error mapping is unchanged.
-  - [ ] 25.6 Test histories:
+  - [x] 25.6 Test histories:
     - Merge-commit PR fully in the window (PR #9 graph).
     - Merge-commit PR truncated at the window, with evidence.
     - Squash PR.
@@ -481,41 +481,41 @@ Branch and commit plan:
     - PR data unavailable.
     - `mergeCommitSha` null or outside the window.
 
-- [ ] 26. Progress heartbeat (`renderer.ts`, `routes.ts`)
-  - [ ] 26.1 Implement and export `ProgressTracker`: `update(fraction)` only stores a value (non-decreasing, capped at 99); `start()` emits immediately and then every `HEARTBEAT_MS = VIDEO_CONFIG.progressIntervalMs / 2`; `stop()` is idempotent, clears the interval, and makes later calls no-ops. `FRAME_PHASE_WEIGHT = 0.1` is a renderer-module constant.
-  - [ ] 26.2 Frame preparation awaits `setImmediate` after each slide and calls `update()` for the frame phase.
-  - [ ] 26.3 ffmpeg `progress` callbacks only call `update()` for the encode phase. Remove the `lastProgressAt` throttle and the renderer's own `onProgress(100)`. Wrap the job in `try/finally { tracker.stop() }`.
-  - [ ] 26.4 Keep one tracker per active job. `abort(jobId)` stops it before its existing cleanup. Do not change ffmpeg termination or when the job ID is sent (F1).
-  - [ ] 26.5 Building on the merged SSE fix in `routes.ts`, add a `closed` flag set on completion, error, and `res.on("close")`; the progress sink checks it before writing; exactly one terminal `{"percent":100,"jobId":…}` event.
+- [x] 26. Progress heartbeat (`renderer.ts`, `routes.ts`)
+  - [x] 26.1 Implement and export `ProgressTracker`: `update(fraction)` only stores a value (non-decreasing, capped at 99); `start()` emits immediately and then every `HEARTBEAT_MS = VIDEO_CONFIG.progressIntervalMs / 2`; `stop()` is idempotent, clears the interval, and makes later calls no-ops. `FRAME_PHASE_WEIGHT = 0.1` is a renderer-module constant.
+  - [x] 26.2 Frame preparation awaits `setImmediate` after each slide and calls `update()` for the frame phase.
+  - [x] 26.3 ffmpeg `progress` callbacks only call `update()` for the encode phase. Remove the `lastProgressAt` throttle and the renderer's own `onProgress(100)`. Wrap the job in `try/finally { tracker.stop() }`.
+  - [x] 26.4 Keep one tracker per active job. `abort(jobId)` stops it before its existing cleanup. Do not change ffmpeg termination or when the job ID is sent (F1).
+  - [x] 26.5 Building on the merged SSE fix in `routes.ts`, add a `closed` flag set on completion, error, and `res.on("close")`; the progress sink checks it before writing; exactly one terminal `{"percent":100,"jobId":…}` event.
 
 - [ ] 27. Tests and validation
-  - [ ] 27.1 `tests/analyzer.test.ts`:
+  - [x] 27.1 `tests/analyzer.test.ts`:
     - `parents`/`mergeCommitSha` mapping; steps 1–7 unchanged (same URLs, same count).
     - `fetchSelectedPrCommits([])` makes **0** requests.
     - N numbers make **≤ N** requests (N = 1, 2, 3); 5 numbers make exactly 3.
     - Duplicates are fetched once; invalid numbers make no request.
     - Each failure kind omits only that PR, never throws, and leaves the other PRs' evidence intact.
-  - [ ] 27.2 `tests/storyboard.test.ts`:
+  - [x] 27.2 `tests/storyboard.test.ts`:
     - `buildChangeGroups` on every 25.6 history.
     - `prsNeedingEvidence` returns nothing for squash, rebase, and graph-proven merges.
     - Property 15: evidence suppression; the timeline-plus-deep-dive allowance; invariance under rewriting every subject and PR title; window soundness; no evidence equals graph-only output; Selected_PRs identical with and without evidence.
     - The PR #9-shaped history yields exactly one detailed slide for PR #9.
     - The truncated merge-commit PR with evidence yields exactly one, and without evidence falls back to graph behavior.
     - Properties 3, 8–12 and 14 still pass on all four existing test repos.
-  - [ ] 27.3 Route/integration tests count every stubbed GitHub request (Property 17):
+  - [x] 27.3 Route/integration tests count every stubbed GitHub request (Property 17):
     - No Selected_PR: baseline requests only.
     - N truncated merge-commit Selected_PRs: baseline + ≤ N.
     - Never more than 15 in total.
     - A cached storyboard request makes 0.
     - A failing lookup still returns HTTP 200 with a storyboard.
-  - [ ] 27.4 Add `tests/progress.test.ts` using `vi.useFakeTimers()` and `vi.mock("fluent-ffmpeg")` with scripted events. Cover:
+  - [x] 27.4 Add `tests/progress.test.ts` using `vi.useFakeTimers()` and `vi.mock("fluent-ffmpeg")` with scripted events. Cover:
     - Cadence: no ffmpeg reports, a single report, reports at +1,999 ms and +3,998 ms, bursts, a long silent encode, frame preparation of 15 slides.
     - Values: monotonic, ≤ 99 before completion.
     - Cleanup: no timers left (`vi.getTimerCount() === 0`) after success, ffmpeg error, frame-write error, and `abort()`.
 
     Add route tests: exactly one terminal event, and no write after completion, error, or client disconnect. No wall-clock sleeps.
-  - [ ] 27.5 Type-check (server, frontend, tests) with 0 errors; full test suite; production build; governed-constant literal scan (the heartbeat must be derived from `progressIntervalMs`, not a literal); `git diff main..HEAD --check`; traceability check (Requirement 2 numbered 1–12, Requirement 4 1–18, Requirement 7 1–18, Properties 1–17, no dangling references).
-  - [ ] 27.6 Update the README's rate-limit note: ≤ 15 requests per uncached analysis, with lookups only for selected merge-commit PRs.
+  - [x] 27.5 Type-check (server, frontend, tests) with 0 errors; full test suite; production build; governed-constant literal scan (the heartbeat must be derived from `progressIntervalMs`, not a literal); `git diff main..HEAD --check`; traceability check (Requirement 2 numbered 1–12, Requirement 4 1–18, Requirement 7 1–18, Properties 1–17, no dangling references).
+  - [x] 27.6 Update the README's rate-limit note: ≤ 15 requests per uncached analysis, with lookups only for selected merge-commit PRs.
   - [ ] 27.7 Live validation through the real server, real GitHub and real ffmpeg, counting every GitHub request.
     - **Long-history merge-commit repository (required):** `rails/rails`.
       - Run analysis first, then use `selectDeepDivePullRequests`/`prsNeedingEvidence` locally, before rendering.
@@ -525,7 +525,13 @@ Branch and commit plan:
     - `chalk/chalk` (squash): 0 lookups, and no evolution regression.
     - For each run: largest SSE gap ≤ `progressIntervalMs` (about 1 s expected), and a single 100 event.
     - Plan for GitHub quota: up to 15 requests per repository; unauthenticated runs may need to span a rate-limit reset.
-  - [ ] 27.8 Fill in the verification table below, remove all temporary files and render outputs, confirm the working tree is clean, and commit (2) and (3) separately. Do not push without approval.
+  - [x] 27.8 Fill in the verification table below, remove all temporary files and render outputs, confirm the working tree is clean, and commit (2) and (3) separately. Do not push without approval.
+
+**27.7 status.** Required long-history live run not achieved: `rails/rails`, `systemd/systemd` and `kubernetes/kubernetes` each produced **zero** Selected_PRs, so no lookup path was exercised.
+- Cause: their READMEs have no capabilities, features, or how-it-works section, so there are no Anchor_Terms and no PR is a Relevant_Change. Each probe was analysis only, 6 requests.
+- Probes stopped there to save quota, per the cheap-probe rule.
+- Completed live runs: this repository (PR #9, one slot, 0 lookups) and `chalk/chalk` (0 lookups, no regression), both with the heartbeat bound met.
+- A qualifying repository needs README feature terms **and** merge-commit PRs with history beyond 50 commits. Candidate search is follow-up F4.
 
 ## Task Dependency Graph
 
@@ -556,29 +562,30 @@ Branch and commit plan:
 
 | # | Property | Result | Evidence |
 |---|----------|--------|----------|
-| 1 | URL Validation Is Server-Authoritative | Pending | Re-run |
-| 2 | Output Constants Are Immutable at Runtime | Pending | Re-run, plus literal scan for the heartbeat |
-| 3 | Slide Ordering Invariant | Pending | Re-run |
-| 4 | Partial Extraction Does Not Abort | Pending | Re-run |
-| 5 | Render Job Isolation | Pending | Re-run |
-| 6 | Cancellation Is Time-Bounded | Pending | Re-run; `abort()` also stops the tracker |
-| 7 | Target Duration Is Range-Bounded | Pending | Re-run |
-| 8 | Content Is Never Fabricated | Pending | Re-run |
-| 9 | Slide Caps Are Ceilings | Pending | Re-run |
-| 10 | Evolution Anchored / feat Fallback | Pending | Re-run with the group rule on the fallback path |
-| 11 | Escaping for Every Slide Type | Pending | Re-run |
-| 12 | Capabilities Not Redundant | Pending | Re-run |
-| 13 | Text Stays Within Slide Bounds | Pending | Re-run |
-| 14 | History Never Defines Current Capabilities | Pending | Re-run, including histories with merge commits and evidence |
-| 15 | One Logical Change, At Most One Detailed Slot | Pending | Task 27.2; live long-history run (27.7) |
-| 16 | Progress Cadence Is Independent of the Encoder | Pending | Task 27.4; live SSE gap measurement (27.7) |
-| 17 | Selected-PR Lookups Are Lazy and Bounded | Pending | Tasks 27.1, 27.3; live request count (27.7) |
+| 1 | URL Validation Is Server-Authoritative | PASS | Analyzer URL tests unchanged; pipeline test: `invalid_url` before any request |
+| 2 | Output Constants Are Immutable at Runtime | PASS | `tests/config.test.ts`; literal scan clean; `HEARTBEAT_MS` derived from `progressIntervalMs` |
+| 3 | Slide Ordering Invariant | PASS | Property test on all four repository fixtures; live order checks |
+| 4 | Partial Extraction Does Not Abort | PASS | Analyzer partial-failure tests; failed selected-PR lookup never surfaces as a failure |
+| 5 | Render Job Isolation | PASS | Renderer path/isolation tests unchanged |
+| 6 | Cancellation Is Time-Bounded | PASS | Abort tests unchanged; `abort()` also stops the tracker (`vi.getTimerCount() === 0`) |
+| 7 | Target Duration Is Range-Bounded | PASS | `tests/routes.test.ts` duration validation; live render hit 60.00 s for a 60 s target |
+| 8 | Content Is Never Fabricated | PASS | Corpus-substring property test on all fixtures |
+| 9 | Slide Caps Are Ceilings | PASS | Caps and noise-injection tests; evolution ≤ 4 in every live run |
+| 10 | Evolution Anchored / feat Fallback | PASS | Fallback tests updated for the group rule (one highlight per group; cap counted after it) |
+| 11 | Escaping for Every Slide Type | PASS | Hostile fixtures cover all 10 slide types |
+| 12 | Capabilities Not Redundant | PASS | Ratio boundary and per-fixture tests |
+| 13 | Text Stays Within Slide Bounds | PASS | Wrap/fit/layout tests unchanged |
+| 14 | History Never Defines Current Capabilities | PASS | History-swap test on all fixtures, including merge-commit histories |
+| 15 | One Logical Change, At Most One Detailed Slot | PASS (live partial) | 20 Change_Group/Property 15 tests incl. PR #9 shape, truncated window with and without evidence, subject-rewrite invariance, window soundness. Live: PR #9 one detailed slot, 0 lookups. The long-history evidence path is unit-tested only; no qualifying live repository (see 27.7) |
+| 16 | Progress Cadence Is Independent of the Encoder | PASS | 16 fake-timer tests (`tests/progress.test.ts`) plus 3 SSE sink tests. Live max gap 1,001 ms and 1,000 ms; one 100 event per render |
+| 17 | Selected-PR Lookups Are Lazy and Bounded | PASS | 7 analyzer lookup tests and 10 pipeline request-count tests (0 for none, N for N, cap 3, ≤ 15 with 6 spec files, 0 on a cache hit, failure → 200). Live: 9 and 6 requests, 0 lookups, 0 on a cache hit |
 
 ## Follow-ups (not in this cycle)
 
 - **F1. Cancellation lifecycle.** (a) `VideoRenderer.abort()` does not terminate the ffmpeg process: it marks the job cancelled and deletes the output file, but encoding keeps running. (b) The UI receives the job ID only with the final SSE event, so it cannot send `DELETE /api/render/:jobId` for an active render. Fix both together. Tasks 24–27 only make sure `abort()` releases the progress timer.
 - **F2. Graph-only grouping beyond the 50-commit window.** Graph-proven membership stops at the window, so merge commits in long-history repositories group only themselves (live: every merge commit in `rails/rails` and `kubernetes/kubernetes`). Selected_PRs are now covered by exact PR-commit lookup. The remaining gap is commits of merge-style PRs that are **not** selected: two commits from the same unselected PR may still each get a highlight. Closing it would mean more lookups beyond Selected_PRs, which needs a separate budget decision.
 - **F3. Rebase-merged PRs.** Only the last rebased commit is linked to its PR (Req 7.18). The PR-commit endpoint returns the pre-rebase SHAs, which don't match the base branch (single-parent merges verified 0/1 on `chalk/chalk` and `systemd/systemd`). This stays a limitation unless a multi-commit rebase merge is shown to keep exact SHAs. No message-based workaround.
+- **F4. Live validation of the selected-PR lookup on a long-history repository.** Find a public repository with README features or capabilities (so PRs can be selected) and merge-commit PRs whose history extends beyond the 50-commit window, then run task 27.7's success criteria. The three suggested candidates don't qualify (no Anchor_Terms).
 - **Deferred live-validation issues 3–12:**
   - 3: patch-release detection misses prefixed tags.
   - 4: release Change_Context and release-vs-PR duplication.

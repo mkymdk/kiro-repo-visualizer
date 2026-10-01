@@ -157,6 +157,8 @@ router.get(
 router.post(
   "/render",
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    // Set on completion, error, or client disconnect; no SSE write after that (Req 4.18).
+    let closed = false;
     try {
       const { slides, targetDurationSeconds } = req.body as {
         slides?: unknown;
@@ -198,9 +200,12 @@ router.post(
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
+      res.on("close", () => {
+        closed = true;
+      });
 
       const onProgress = (percent: number): void => {
-        if (!res.writableEnded) {
+        if (!closed && !res.writableEnded) {
           res.write(`data: ${JSON.stringify({ percent })}\n\n`);
         }
       };
@@ -211,14 +216,19 @@ router.post(
         validatedDuration,
       );
 
-      if (!res.writableEnded) {
+      // The single terminal event (Req 4.17).
+      if (!closed && !res.writableEnded) {
+        closed = true;
         res.write(
           `data: ${JSON.stringify({ percent: 100, jobId: job.id })}\n\n`,
         );
         res.end();
       }
+      closed = true;
     } catch (err: unknown) {
-      if (res.writableEnded) {
+      const alreadyClosed = closed;
+      closed = true;
+      if (res.writableEnded || (alreadyClosed && res.headersSent)) {
         // Response already completed — nothing more can be sent, and handing
         // the error to Express here would only trigger a spurious
         // "headers already sent" warning. The error is already handled.
