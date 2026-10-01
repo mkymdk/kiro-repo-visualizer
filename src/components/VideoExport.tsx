@@ -22,7 +22,20 @@ interface VideoExportProps {
  * Step 4 — renders the video, shows progress, and offers a download link.
  */
 export function VideoExport({ slides, onBack }: VideoExportProps): React.ReactElement {
-  const { percent, jobId, status, error, cancel } = useRenderJob(slides);
+  // The user selects a Target_Duration before rendering starts (Req 4.10).
+  // Default to the midpoint of the allowed range, clamped to bounds.
+  const defaultDuration = Math.round(
+    (VIDEO_CONFIG.minDurationSeconds + VIDEO_CONFIG.maxDurationSeconds) / 2,
+  );
+  const [targetDuration, setTargetDuration] = useState<number>(defaultDuration);
+  const [hasStarted, setHasStarted] = useState<boolean>(false);
+
+  // Rendering only begins once the user commits: until then we pass an empty
+  // slide array so the hook does not fire.
+  const { percent, jobId, status, error, cancel } = useRenderJob(
+    hasStarted ? slides : [],
+    targetDuration,
+  );
   const [confirmLargeDownload, setConfirmLargeDownload] = useState<boolean>(false);
   const downloadRef = useRef<HTMLAnchorElement>(null);
 
@@ -67,22 +80,57 @@ export function VideoExport({ slides, onBack }: VideoExportProps): React.ReactEl
     <section aria-label="Video export">
       <h2>Export Video</h2>
 
-      <progress
-        value={percent}
-        max={100}
-        aria-label="Video rendering progress"
-        aria-valuenow={percent}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        style={{ width: "100%" }}
-      />
-      <p aria-live="polite">
-        {isRendering && `Rendering… ${percent}%`}
-        {isComplete && "Rendering complete!"}
-        {isFailed && "Rendering failed."}
-        {isCancelled && "Rendering cancelled."}
-        {status === "idle" && "Preparing…"}
-      </p>
+      {!hasStarted && (
+        <div>
+          <label htmlFor="target-duration">
+            Video duration (seconds):
+          </label>
+          <input
+            id="target-duration"
+            type="range"
+            min={VIDEO_CONFIG.minDurationSeconds}
+            max={VIDEO_CONFIG.maxDurationSeconds}
+            step={1}
+            value={targetDuration}
+            onChange={(e) => setTargetDuration(Number(e.target.value))}
+            aria-describedby="target-duration-value"
+          />
+          <output id="target-duration-value" htmlFor="target-duration">
+            {targetDuration}s (allowed {VIDEO_CONFIG.minDurationSeconds}–
+            {VIDEO_CONFIG.maxDurationSeconds}s)
+          </output>
+          <div>
+            <button
+              type="button"
+              onClick={() => setHasStarted(true)}
+              disabled={slides.length === 0}
+            >
+              Start Rendering
+            </button>
+          </div>
+        </div>
+      )}
+
+      {hasStarted && (
+        <>
+          <progress
+            value={percent}
+            max={100}
+            aria-label="Video rendering progress"
+            aria-valuenow={percent}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            style={{ width: "100%" }}
+          />
+          <p aria-live="polite">
+            {isRendering && `Rendering… ${percent}%`}
+            {isComplete && "Rendering complete!"}
+            {isFailed && "Rendering failed."}
+            {isCancelled && "Rendering cancelled."}
+            {status === "idle" && "Preparing…"}
+          </p>
+        </>
+      )}
 
       {isRendering && (
         <button

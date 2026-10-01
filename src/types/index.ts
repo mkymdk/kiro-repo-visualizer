@@ -18,8 +18,61 @@ export interface Commit {
   /** ISO 8601 timestamp of when the commit was authored. */
   timestamp: string;
   /** The first line of the commit message. */
+  subject: string;
+  /**
+   * The remainder of the commit message after the first line, with leading
+   * blank lines trimmed. Empty string when the commit has no body. Trailer
+   * lines are retained here and removed during Change_Context extraction.
+   */
+  body: string;
+  /** Alias of `subject`, retained for existing callers. */
   message: string;
 }
+
+/** A merged pull request fetched from the GitHub pulls API. */
+export interface PullRequest {
+  /** Pull request number. */
+  number: number;
+  /** Pull request title. */
+  title: string;
+  /** Pull request description; empty string when absent. Length-capped by the analyzer. */
+  body: string;
+  /** Lowercased label names. */
+  labels: string[];
+  /** ISO 8601 merge timestamp. Only merged pull requests are retained. */
+  mergedAt: string;
+  /** True when the author account is a bot. */
+  isBot: boolean;
+}
+
+/** A published, non-draft GitHub release. */
+export interface Release {
+  /** Release display name, or null when unnamed. */
+  name: string | null;
+  /** Git tag the release points at. */
+  tagName: string;
+  /** ISO 8601 publication timestamp. */
+  publishedAt: string;
+  /** Release notes; empty string when absent. Length-capped by the analyzer. */
+  body: string;
+}
+
+/** Repository-level metadata from the GitHub repository endpoint. */
+export interface RepoMetadata {
+  /** Short repository description, or null. */
+  description: string | null;
+  /** Repository topics. */
+  topics: string[];
+  /** Star count, or null when unavailable. */
+  stars: number | null;
+  /** Primary language, or null. */
+  language: string | null;
+  /** License SPDX id or name, or null. */
+  license: string | null;
+}
+
+/** The nature of a notable change. */
+export type ChangeCategory = "Breaking Change" | "Feature" | "Bug Fix" | "Refactor";
 
 /** A single node in the repository's git tree. */
 export interface DirectoryNode {
@@ -42,8 +95,8 @@ export interface SpecDocument {
 /**
  * The full result of analysing a GitHub repository.
  *
- * All four data sections are optional because any one of the extraction
- * steps may have been skipped due to a partial failure. The `partialFailures`
+ * Every data section may be empty because any extraction step may have been
+ * skipped due to a partial failure, or the source may legitimately be empty. The `partialFailures`
  * array records the names of steps that were skipped.
  */
 export interface RepoAnalysisResult {
@@ -51,14 +104,20 @@ export interface RepoAnalysisResult {
   owner: string;
   /** GitHub repository name. */
   repo: string;
+  /** Repository metadata, or null if the step failed. */
+  metadata: RepoMetadata | null;
   /** Flat list of directory/file nodes up to 3 path-separator levels deep. */
   directoryTree: DirectoryNode[];
   /** Raw text of the repository README, or null if not present or failed. */
   readmeText: string | null;
   /** Up to 50 most-recent commits. */
   commits: Commit[];
-  /** Spec documents found in the `.kiro` directory. */
+  /** Markdown spec documents found under `.kiro/specs/` (at most 6). */
   specDocs: SpecDocument[];
+  /** Merged pull requests among the 50 most recently updated closed PRs. */
+  pullRequests: PullRequest[];
+  /** Published, non-draft releases among the 10 most recent. */
+  releases: Release[];
   /**
    * Names of extraction steps that were skipped due to non-fatal errors.
    * An empty array means all steps succeeded.
@@ -73,17 +132,27 @@ export interface RepoAnalysisResult {
 /**
  * Discriminated union of all slide types produced by the storyboard generator.
  *
- * - `"intro"` — introduction slide built from README content
+ * - `"intro"` — overview: name, description, topics, first README paragraph
+ * - `"capabilities"` — what users can do with the repository
+ * - `"run"` — "how to run this repository" steps extracted from the README
  * - `"architecture"` — ASCII tree of the top-level directory structure
- * - `"highlight"` — a single noteworthy commit
- * - `"spec"` — a summary of `.kiro` spec documentation
- * - `"conclusion"` — closing slide with repo name and GitHub URL
+ * - `"howItWorks"` — how the repository works (README section or spec docs)
+ * - `"feature"` — one Key_Feature, or the Key_Feature summary slide
+ * - `"evolution"` — Evolution_Timeline of releases and significant PRs
+ * - `"change"` — deep dive on a significant PR or release
+ * - `"highlight"` — a commit used as fallback or supplementary evolution evidence
+ * - `"conclusion"` — closing slide with repo name, URL, and metadata
  */
 export type SlideType =
   | "intro"
+  | "capabilities"
+  | "run"
   | "architecture"
+  | "howItWorks"
+  | "feature"
+  | "evolution"
+  | "change"
   | "highlight"
-  | "spec"
   | "conclusion";
 
 /** A single slide in a generated storyboard. */
@@ -142,6 +211,7 @@ export interface RenderJob {
  * All valid error codes that can be returned by the API.
  *
  * - `invalid_url`          — URL fails the GitHub allowlist regex
+ * - `invalid_input`        — a request parameter is malformed or out of range (e.g. Target_Duration)
  * - `repo_not_found`       — repository is inaccessible or does not exist
  * - `rate_limit_exceeded`  — GitHub API rate limit hit
  * - `request_timeout`      — individual outbound request exceeded 10 s
@@ -152,6 +222,7 @@ export interface RenderJob {
  */
 export type ApiErrorCode =
   | "invalid_url"
+  | "invalid_input"
   | "repo_not_found"
   | "rate_limit_exceeded"
   | "request_timeout"

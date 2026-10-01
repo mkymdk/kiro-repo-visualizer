@@ -46,14 +46,40 @@ export const SLIDE_CONFIG = Object.freeze({
   maxSlides: 15,
   /** Maximum words shown in each slide preview summary */
   previewMaxWords: 50,
-  /** Maximum words extracted from README for the introduction slide */
-  introMaxWords: 300,
+  /** Maximum words extracted from the README's first prose paragraph for the overview slide */
+  introMaxWords: 120,
   /** Maximum section headings listed on a spec documentation slide */
   specMaxHeadings: 5,
   /** Maximum sentences extracted per spec section on a spec documentation slide */
   specMaxSentences: 3,
   /** Maximum Engineering Highlights extracted from commit history */
   maxHighlights: 10,
+  /** Maximum steps/lines shown on the "how to run" slide */
+  runMaxSteps: 8,
+  /** Maximum words kept per step on the "how to run" slide */
+  runMaxWordsPerStep: 20,
+  /** Maximum Capabilities listed on the capabilities slide */
+  capabilitiesMaxItems: 6,
+  /** Maximum words kept per Capability */
+  capabilityMaxWords: 20,
+  /** Capabilities slide is omitted when more than this fraction of Capabilities match a Key_Feature */
+  capabilitiesMaxOverlapRatio: 0.5,
+  /** Maximum Key_Feature slides (individual + summary); a ceiling, not a target */
+  maxFeatureSlides: 5,
+  /** Maximum words kept per Key_Feature description */
+  featureMaxWords: 40,
+  /** Maximum evolution slides (timeline + notable changes + commit highlights); a ceiling, not a target */
+  maxEvolutionSlides: 4,
+  /** Maximum entries listed on the Evolution_Timeline slide */
+  maxEvolutionItems: 8,
+  /** Minimum eligible entries required before an Evolution_Timeline slide is generated */
+  minEvolutionItems: 2,
+  /** Maximum words kept for a PR / release / commit Change_Context */
+  changeContextMaxWords: 30,
+  /** Minimum length of a token that can act as an Anchor_Term for relevance matching */
+  relevanceMinTermLength: 4,
+  /** Maximum `feat:` commit highlights used when no Anchor_Terms exist; a ceiling within maxEvolutionSlides */
+  maxFallbackHighlights: 2,
 } as const);
 
 export type VideoConfig = typeof VIDEO_CONFIG;

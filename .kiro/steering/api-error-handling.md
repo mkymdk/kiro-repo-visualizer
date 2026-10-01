@@ -32,6 +32,7 @@ All error responses — whether from validation failures, network errors, timeou
 | `error` code          | When to use                                                      |
 |-----------------------|------------------------------------------------------------------|
 | `invalid_url`         | URL fails format validation (not a valid GitHub repo URL)        |
+| `invalid_input`       | A request parameter is malformed or out of range (e.g. an out-of-range `targetDurationSeconds`); HTTP 400 |
 | `repo_not_found`      | Repository does not exist or is not publicly accessible          |
 | `rate_limit_exceeded` | GitHub API returned a 429 / rate-limit response                  |
 | `request_timeout`     | Outbound HTTP request did not complete within the 10s limit      |

@@ -13,6 +13,10 @@ import {
   fetchReadme,
   fetchCommits,
   fetchSpecDocs,
+  fetchMetadata,
+  fetchPullRequests,
+  fetchReleases,
+  selectSpecPaths,
   analyzeRepository,
   computeRateLimitWaitSeconds,
   formatRateLimitMessage,
@@ -35,7 +39,6 @@ function mockResponse(
     ok: status >= 200 && status < 300,
     status,
     headers: responseHeaders,
-    body: null,
     text: async () => bodyStr,
     json: async () => JSON.parse(bodyStr),
     // Simulate a readable stream for readCappedBody
@@ -198,7 +201,9 @@ describe("safeFetch timeout", () => {
 // ---------------------------------------------------------------------------
 
 describe("fetchDirectoryTree", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("returns DirectoryNode[] filtered to <= 3 path levels", async () => {
     const tree = [
@@ -255,7 +260,9 @@ describe("fetchDirectoryTree", () => {
 // ---------------------------------------------------------------------------
 
 describe("fetchReadme", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("returns readme text on success", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("# Hello World")));
@@ -282,7 +289,9 @@ describe("fetchReadme", () => {
 // ---------------------------------------------------------------------------
 
 describe("fetchCommits", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("maps GitHub commit shape to Commit[]", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse(BASE_COMMITS)));
@@ -320,62 +329,257 @@ describe("fetchCommits", () => {
 });
 
 // ---------------------------------------------------------------------------
-// fetchSpecDocs
+// URL-routed fetch mock for multi-step tests
 // ---------------------------------------------------------------------------
 
+type Route = Response | Error | ((url: string) => Response | Error);
+
+/**
+ * Build a fetch mock that answers by URL path. Longest matching key wins;
+ * unmatched URLs return 404.
+ */
+function routedFetch(routes: Record<string, Route>) {
+  return vi.fn(async (input: string | URL): Promise<Response> => {
+    const url = String(input);
+    const path = new URL(url).pathname + new URL(url).search;
+    const key = Object.keys(routes)
+      .filter((k) => path.startsWith(k))
+      .sort((a, b) => b.length - a.length)[0];
+    if (key === undefined) return mockResponse("Not Found", 404);
+    const route = routes[key]!;
+    const value = typeof route === "function" ? route(url) : route;
+    if (value instanceof Error) throw value;
+    return value;
+  });
+}
+
+const R = "/repos/owner/repo";
+
+/** Routes for a fully successful analysis; override individual entries per test. */
+function happyRoutes(): Record<string, Route> {
+  return {
+    [R]: mockResponse({ description: "Desc", topics: ["t"], stargazers_count: 5, language: "TS", license: { spdx_id: "MIT" } }),
+    [`${R}/git/trees/HEAD`]: mockResponse({ tree: BASE_TREE }),
+    [`${R}/readme`]: mockResponse("# README"),
+    [`${R}/commits`]: mockResponse(BASE_COMMITS),
+    [`${R}/pulls`]: mockResponse([]),
+    [`${R}/releases`]: mockResponse([]),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// fetchMetadata
+// ---------------------------------------------------------------------------
+
+describe("fetchMetadata", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("maps description, topics, stars, language, and license", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse({
+      description: "A tool", topics: ["a", "b"], stargazers_count: 42, language: "Go",
+      license: { spdx_id: "Apache-2.0", name: "Apache License 2.0" },
+    })));
+    expect(await fetchMetadata("owner", "repo")).toEqual({
+      description: "A tool", topics: ["a", "b"], stars: 42, language: "Go", license: "Apache-2.0",
+    });
+  });
+
+  it("uses the license name when spdx_id is NOASSERTION, and nulls missing fields", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse({
+      description: null, license: { spdx_id: "NOASSERTION", name: "Custom" },
+    })));
+    expect(await fetchMetadata("owner", "repo")).toEqual({
+      description: null, topics: [], stars: null, language: null, license: "Custom",
+    });
+  });
+
+  it("throws repo_not_found on 404 and on a non-rate-limit 403", async () => {
+    for (const status of [404, 403]) {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("x", status)));
+      await expect(fetchMetadata("owner", "repo")).rejects.toThrow(
+        expect.objectContaining({ code: "repo_not_found" }),
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchCommits — subject and body
+// ---------------------------------------------------------------------------
+
+describe("fetchCommits subject/body mapping", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("splits the message into subject and body with leading blank lines trimmed", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse([{
+      sha: "s1",
+      commit: { author: { name: "A", date: "2024-01-01T00:00:00Z" }, message: "feat: x\n\n\nWhy it matters.\nSigned-off-by: A <a@x>\n" },
+    }])));
+    const [c] = await fetchCommits("owner", "repo");
+    expect(c?.subject).toBe("feat: x");
+    expect(c?.message).toBe("feat: x");
+    expect(c?.body).toBe("Why it matters.\nSigned-off-by: A <a@x>");
+  });
+
+  it("uses an empty body for single-line messages", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse(BASE_COMMITS)));
+    const [c] = await fetchCommits("owner", "repo");
+    expect(c?.body).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchPullRequests / fetchReleases
+// ---------------------------------------------------------------------------
+
+describe("fetchPullRequests", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps merged PRs only and maps labels, isBot, and a capped body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse([
+      { number: 1, title: "feat: a", body: "x".repeat(20_000), merged_at: "2024-01-01T00:00:00Z",
+        labels: [{ name: "Enhancement" }], user: { login: "alice", type: "User" } },
+      { number: 2, title: "closed unmerged", merged_at: null, labels: [], user: { type: "User" } },
+      { number: 3, title: "Bump x", merged_at: "2024-01-02T00:00:00Z", labels: [], user: { login: "dependabot[bot]", type: "User" } },
+      { number: 4, title: "y", merged_at: "2024-01-03T00:00:00Z", body: null, labels: [], user: { login: "ci", type: "Bot" } },
+    ])));
+    const prs = await fetchPullRequests("owner", "repo");
+    expect(prs.map((p) => p.number)).toEqual([1, 3, 4]);
+    expect(prs[0]?.labels).toEqual(["enhancement"]);
+    expect(prs[0]?.body.length).toBe(10_000);
+    expect(prs[0]?.isBot).toBe(false);
+    expect(prs[1]?.isBot).toBe(true);
+    expect(prs[2]?.isBot).toBe(true);
+    expect(prs[2]?.body).toBe("");
+  });
+
+  it("returns [] on 404", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("x", 404)));
+    expect(await fetchPullRequests("owner", "repo")).toEqual([]);
+  });
+
+  it("throws network_error on 500", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("x", 500)));
+    await expect(fetchPullRequests("owner", "repo")).rejects.toThrow(
+      expect.objectContaining({ code: "network_error" }),
+    );
+  });
+});
+
+describe("fetchReleases", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("drops drafts and unpublished releases", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse([
+      { tag_name: "v2.0.0", name: "Two", draft: true, published_at: null, body: "" },
+      { tag_name: "v1.0.0", name: "", draft: false, published_at: "2024-01-01T00:00:00Z", body: "Notes" },
+    ])));
+    expect(await fetchReleases("owner", "repo")).toEqual([
+      { tagName: "v1.0.0", name: null, publishedAt: "2024-01-01T00:00:00Z", body: "Notes" },
+    ]);
+  });
+
+  it("returns [] on 404", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("x", 404)));
+    expect(await fetchReleases("owner", "repo")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// selectSpecPaths / fetchSpecDocs
+// ---------------------------------------------------------------------------
+
+describe("selectSpecPaths", () => {
+  const blob = (path: string, size = 100): { path: string; type: "blob"; size: number } => ({ path, type: "blob", size });
+
+  it("finds Markdown files at any depth under .kiro/specs/ only", () => {
+    const paths = selectSpecPaths([
+      blob(".kiro/specs/a/requirements.md"),
+      blob(".kiro/specs/a/deep/notes.md"),
+      blob(".kiro/steering/code-style.md"),
+      blob(".kiro/hooks/h.json"),
+      blob(".kiro/specs/a/tasks.txt"),
+      blob("docs/specs/x.md"),
+    ]);
+    expect(paths).toEqual([".kiro/specs/a/requirements.md", ".kiro/specs/a/deep/notes.md"]);
+  });
+
+  it("puts requirements.md and design.md first, then ascending path, capped at 6", () => {
+    const paths = selectSpecPaths([
+      blob(".kiro/specs/z/tasks.md"),
+      blob(".kiro/specs/b/design.md"),
+      blob(".kiro/specs/a/tasks.md"),
+      blob(".kiro/specs/a/requirements.md"),
+      blob(".kiro/specs/a/design.md"),
+      blob(".kiro/specs/c/extra.md"),
+      blob(".kiro/specs/d/extra.md"),
+      blob(".kiro/specs/e/extra.md"),
+    ]);
+    expect(paths).toEqual([
+      ".kiro/specs/a/design.md",
+      ".kiro/specs/a/requirements.md",
+      ".kiro/specs/b/design.md",
+      ".kiro/specs/a/tasks.md",
+      ".kiro/specs/c/extra.md",
+      ".kiro/specs/d/extra.md",
+    ]);
+  });
+
+  it("skips files over 1 MB and rejects traversal, empty, and backslash segments", () => {
+    const paths = selectSpecPaths([
+      blob(".kiro/specs/a/huge.md", 2 * 1024 * 1024),
+      blob(".kiro/specs/../../etc/passwd.md"),
+      blob(".kiro/specs/./a.md"),
+      blob(".kiro/specs//a.md"),
+      blob(".kiro/specs/a\\b.md"),
+      blob(".kiro/specs/ok.md"),
+    ]);
+    expect(paths).toEqual([".kiro/specs/ok.md"]);
+  });
+});
+
 describe("fetchSpecDocs", () => {
-  afterEach(() => vi.unstubAllGlobals());
-
-  it("returns empty array on 404 (.kiro directory absent)", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("Not Found", 404)));
-    const result = await fetchSpecDocs("owner", "repo");
-    expect(result).toEqual([]);
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
-  it("fetches each file and returns SpecDocument[]", async () => {
-    const listing = [
-      {
-        type: "file",
-        path: ".kiro/design.md",
-        size: 500,
-        download_url: "https://raw.githubusercontent.com/owner/repo/main/.kiro/design.md",
-      },
-    ];
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(mockResponse(listing))           // directory listing
-      .mockResolvedValueOnce(mockResponse("# Design Doc"));   // file content
+  it("fetches each path from the contents endpoint with per-segment encoding", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockResponse("# Doc"));
     vi.stubGlobal("fetch", fetchMock);
-    const result = await fetchSpecDocs("owner", "repo");
-    expect(result).toHaveLength(1);
-    expect(result[0]?.content).toBe("# Design Doc");
+    const docs = await fetchSpecDocs("owner", "repo", [".kiro/specs/my spec/design.md"]);
+    expect(docs).toEqual([{ path: ".kiro/specs/my spec/design.md", content: "# Doc" }]);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "https://api.github.com/repos/owner/repo/contents/.kiro/specs/my%20spec/design.md",
+    );
   });
 
-  it("skips files > 1 MB", async () => {
-    const listing = [
-      {
-        type: "file",
-        path: ".kiro/huge.md",
-        size: 2 * 1024 * 1024, // 2 MB — exceeds limit
-        download_url: "https://raw.githubusercontent.com/owner/repo/main/.kiro/huge.md",
-      },
-    ];
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse(listing)));
-    const result = await fetchSpecDocs("owner", "repo");
-    expect(result).toEqual([]);
+  it("re-validates paths and skips invalid ones without fetching", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockResponse("# Doc"));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await fetchSpecDocs("owner", "repo", [".kiro/specs/../../x.md", "README.md"])).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("skips files whose download_url targets a disallowed host", async () => {
-    const listing = [
-      {
-        type: "file",
-        path: ".kiro/evil.md",
-        size: 100,
-        download_url: "https://evil.example.com/file.md",
-      },
-    ];
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse(listing)));
-    const result = await fetchSpecDocs("owner", "repo");
-    expect(result).toEqual([]);
+  it("skips a file that fails but propagates rate limits", async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(mockResponse("x", 500))
+      .mockResolvedValueOnce(mockResponse("# B")));
+    expect(await fetchSpecDocs("owner", "repo", [".kiro/specs/a.md", ".kiro/specs/b.md"])).toEqual([
+      { path: ".kiro/specs/b.md", content: "# B" },
+    ]);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("x", 429)));
+    await expect(fetchSpecDocs("owner", "repo", [".kiro/specs/a.md"])).rejects.toThrow(
+      expect.objectContaining({ code: "rate_limit_exceeded" }),
+    );
   });
 });
 
@@ -384,7 +588,9 @@ describe("fetchSpecDocs", () => {
 // ---------------------------------------------------------------------------
 
 describe("analyzeRepository", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("throws invalid_url for a non-GitHub URL", async () => {
     await expect(analyzeRepository("https://gitlab.com/o/r")).rejects.toThrow(
@@ -392,53 +598,92 @@ describe("analyzeRepository", () => {
     );
   });
 
-  it("throws repo_not_found when the tree step returns 404", async () => {
+  it("uses the metadata step as the repo_not_found source", async () => {
+    vi.stubGlobal("fetch", routedFetch({ ...happyRoutes(), [R]: mockResponse("Not Found", 404) }));
+    await expect(analyzeRepository("https://github.com/owner/repo")).rejects.toThrow(
+      expect.objectContaining({ code: "repo_not_found" }),
+    );
+  });
+
+  it("throws repo_not_found when every endpoint returns 404", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse("Not Found", 404)));
     await expect(analyzeRepository("https://github.com/owner/repo")).rejects.toThrow(
       expect.objectContaining({ code: "repo_not_found" }),
     );
   });
 
-  it("returns partial result when one step fails", async () => {
-    // Step 1 (tree): success
-    // Step 2 (readme): 404 → null (not a failure)
-    // Step 3 (commits): network error → partial failure
-    // Step 4 (specDocs): 404 → [] (not a failure)
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(mockResponse({ tree: BASE_TREE }))    // tree
-      .mockResolvedValueOnce(mockResponse("", 404))                // readme → null
-      .mockRejectedValueOnce(new Error("ECONNREFUSED"))            // commits → fail
-      .mockResolvedValueOnce(mockResponse("[]", 404));             // specDocs → []
-    vi.stubGlobal("fetch", fetchMock);
+  it("returns a full result on success, with empty sources not recorded as failures", async () => {
+    vi.stubGlobal("fetch", routedFetch(happyRoutes()));
     const result = await analyzeRepository("https://github.com/owner/repo");
-    expect(result.partialFailures).toContain("commits");
-    expect(result.directoryTree.length).toBeGreaterThan(0);
+    expect(result.metadata?.description).toBe("Desc");
+    expect(result.readmeText).toBe("# README");
+    expect(result.commits).toHaveLength(1);
+    expect(result.specDocs).toEqual([]);
+    expect(result.pullRequests).toEqual([]);
+    expect(result.releases).toEqual([]);
+    expect(result.partialFailures).toEqual([]);
   });
 
-  it("propagates rate_limit_exceeded immediately", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(mockResponse("Too Many Requests", 429)),
-    );
+  it("treats 404 for pulls and releases as empty, not as partial failures", async () => {
+    const routes = happyRoutes();
+    delete routes[`${R}/pulls`];
+    delete routes[`${R}/releases`];
+    vi.stubGlobal("fetch", routedFetch(routes));
+    const result = await analyzeRepository("https://github.com/owner/repo");
+    expect(result.pullRequests).toEqual([]);
+    expect(result.releases).toEqual([]);
+    expect(result.partialFailures).toEqual([]);
+  });
+
+  it("fetches 4-level-deep spec files discovered in the unfiltered tree", async () => {
+    const tree = [
+      ...BASE_TREE,
+      { path: ".kiro", type: "tree" },
+      { path: ".kiro/specs/app/requirements.md", type: "blob", size: 10 },
+      { path: ".kiro/steering/style.md", type: "blob", size: 10 },
+    ];
+    vi.stubGlobal("fetch", routedFetch({
+      ...happyRoutes(),
+      [`${R}/git/trees/HEAD`]: mockResponse({ tree }),
+      [`${R}/contents/.kiro/specs/app/requirements.md`]: mockResponse("# Reqs"),
+    }));
+    const result = await analyzeRepository("https://github.com/owner/repo");
+    expect(result.specDocs).toEqual([{ path: ".kiro/specs/app/requirements.md", content: "# Reqs" }]);
+    expect(result.directoryTree.some((n) => n.path.startsWith(".kiro/specs/app/"))).toBe(false);
+  });
+
+  it("records a failing step and continues with the rest", async () => {
+    vi.stubGlobal("fetch", routedFetch({
+      ...happyRoutes(),
+      [`${R}/commits`]: new Error("ECONNREFUSED"),
+      [`${R}/pulls`]: mockResponse("boom", 500),
+    }));
+    const result = await analyzeRepository("https://github.com/owner/repo");
+    expect(result.partialFailures).toEqual(expect.arrayContaining(["commits", "pullRequests"]));
+    expect(result.partialFailures).not.toContain("releases");
+    expect(result.readmeText).toBe("# README");
+  });
+
+  it("records both directoryTree and specDocs when the tree step fails", async () => {
+    vi.stubGlobal("fetch", routedFetch({ ...happyRoutes(), [`${R}/git/trees/HEAD`]: mockResponse("boom", 500) }));
+    const result = await analyzeRepository("https://github.com/owner/repo");
+    expect(result.partialFailures).toEqual(expect.arrayContaining(["directoryTree", "specDocs"]));
+    expect(result.directoryTree).toEqual([]);
+    expect(result.metadata).not.toBeNull();
+  });
+
+  it("propagates rate_limit_exceeded from any step", async () => {
+    vi.stubGlobal("fetch", routedFetch({ ...happyRoutes(), [`${R}/releases`]: mockResponse("x", 429) }));
     await expect(analyzeRepository("https://github.com/owner/repo")).rejects.toThrow(
       expect.objectContaining({ code: "rate_limit_exceeded" }),
     );
   });
 
-  it("returns a RepoAnalysisResult with all fields on full success", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(mockResponse({ tree: BASE_TREE }))  // tree
-      .mockResolvedValueOnce(mockResponse("# README"))           // readme
-      .mockResolvedValueOnce(mockResponse(BASE_COMMITS))         // commits
-      .mockResolvedValueOnce(mockResponse("Not Found", 404));    // specDocs
+  it("only contacts api.github.com", async () => {
+    const fetchMock = routedFetch(happyRoutes());
     vi.stubGlobal("fetch", fetchMock);
-    const result = await analyzeRepository("https://github.com/owner/repo");
-    expect(result.owner).toBe("owner");
-    expect(result.repo).toBe("repo");
-    expect(result.readmeText).toBe("# README");
-    expect(result.commits).toHaveLength(1);
-    expect(result.specDocs).toEqual([]);
-    expect(result.partialFailures).toEqual([]);
+    await analyzeRepository("https://github.com/owner/repo");
+    for (const [url] of fetchMock.mock.calls) expect(new URL(String(url)).hostname).toBe("api.github.com");
   });
 });
 
@@ -536,7 +781,9 @@ describe("formatRateLimitMessage", () => {
 // ---------------------------------------------------------------------------
 
 describe("rate-limit message reflects response headers", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it("fetchDirectoryTree surfaces a minutes-based message from X-RateLimit-Reset", async () => {
     const futureReset = Math.floor(Date.now() / 1000) + 600; // ~10 min out

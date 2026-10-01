@@ -18,10 +18,13 @@ function makeResult(owner: string, repo: string): RepoAnalysisResult {
   return {
     owner,
     repo,
+    metadata: null,
     directoryTree: [{ path: "src", type: "tree" }],
     readmeText: "# readme",
     commits: [],
     specDocs: [],
+    pullRequests: [],
+    releases: [],
     partialFailures: [],
   };
 }

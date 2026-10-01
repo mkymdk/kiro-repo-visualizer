@@ -178,3 +178,228 @@ Run against the completed implementation:
 
 - Property 2 initially failed: `as const` provides compile-time readonly typing only and does not freeze the object at runtime, so `VIDEO_CONFIG`/`SLIDE_CONFIG` were mutable in emitted JS. Fixed by wrapping both exports in `Object.freeze(...)` in `src/config/output.ts` (task 2.1/2.2 required a "frozen" object). Regression guard added in `tests/config.test.ts`.
 - Full suite after fix: 120 tests passing across 5 files; `src/server/` coverage 83.16%.
+
+---
+
+# Implementation Plan: Download-flow Features (Run-Instructions Slide + Target Duration)
+
+## Overview
+
+Two independent extensions to the existing pipeline:
+
+- **Feature A — "How to run this repository" slide** (Requirements 5.7–5.11). A new `"run"` slide type extracted from the already-fetched README section (Installation / Getting Started / Setup / Usage / Quick Start), assembled purely in `storyboard.ts`, positioned after architecture and before highlights. No new GitHub calls, no repository code execution.
+- **Feature B — user-selectable video duration** (Requirements 4.10–4.14). A user-chosen `Target_Duration` within `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`, validated pre-SSE in `routes.ts` (new `invalid_input` / HTTP 400 code), threaded through `useRenderJob` and `VideoExport`, consumed by `calculateSecondsPerSlide`.
+
+The two features share only the config/type foundation (wave 0) and the final verification (last wave). Their feature-specific work does not cross modules, so it runs in parallel.
+
+## Tasks
+
+- [x] 13. Shared foundation — config, types, steering
+  - [x] 13.1 Add `runMaxSteps` (8) and `runMaxWordsPerStep` (20) to `SLIDE_CONFIG` in `src/config/output.ts` (values only; imported by name everywhere else)
+  - [x] 13.2 Add `"run"` member to the `SlideType` union in `src/types/index.ts` and update its doc comment
+  - [x] 13.3 Add `"invalid_input"` member to the `ApiErrorCode` union in `src/types/index.ts` and update its doc comment
+  - [x] 13.4 Add the `invalid_input` row (HTTP 400 — malformed/out-of-range request parameter) to the standard error-code table in `.kiro/steering/api-error-handling.md`
+  - [x] 13.5 Verify `npm run build` compiles cleanly with the new union members and config keys
+
+- [x] 14. Feature A — run-instructions slide (storyboard.ts)
+  - [x] 14.1 Implement an unexported `extractRunInstructions(readmeText: string): { heading: string; steps: string[] } | null` helper — finds the first Markdown heading matching (case-insensitive) `Installation|Getting Started|Setup|Usage|Quick Start` in document order, returns its section content
+  - [x] 14.2 Within the extractor, prefer the first fenced code block in the matched section as the step source (split into lines, cap at `SLIDE_CONFIG.runMaxSteps`); fall back to non-blank prose lines when no code block is present
+  - [x] 14.3 Truncate each step to `SLIDE_CONFIG.runMaxWordsPerStep` words via `truncateToWords`; HTML-escape all output
+  - [x] 14.4 Implement exported `buildRunSlide(readmeText: string | null): Slide | null` — returns `null` when README is absent or no heading matches; otherwise builds a `"run"` slide with heading title, step body, and a `previewSummary` capped at `SLIDE_CONFIG.previewMaxWords`
+  - [x] 14.5 Insert the run slide into `generateStoryboard` immediately after architecture and before highlights; include it in the `fixedCount` used for the `maxSlides` highlight-trim math so the count stays within `[minSlides, maxSlides]`
+  - [x] 14.6 Extend `tests/storyboard.test.ts`: heading-keyword matching, fenced-code-block preference over prose, first-match-in-document-order, `runMaxSteps`/`runMaxWordsPerStep` truncation, graceful omission (no README / no match), and ordering assertion (run slide index is directly after architecture)
+
+- [x] 15. Feature B — target duration (renderer.ts, routes.ts, hook, component)
+  - [x] 15.1 Change `calculateSecondsPerSlide(slideCount: number, targetDurationSeconds?: number): number` — when a target is supplied, distribute it across slides (floor at 1s); when omitted, keep existing slide-count-derived default; update the TSDoc (Args/Returns/Raises)
+  - [x] 15.2 Thread the target through `VideoRenderer.start(slides, onProgress, targetDurationSeconds?)`, passing it to `calculateSecondsPerSlide`; update TSDoc
+  - [x] 15.3 In `routes.ts`, add `invalid_input: 400` to the `HTTP_STATUS` map
+  - [x] 15.4 In `POST /api/render`, read `targetDurationSeconds` from the body and validate it **before** setting SSE headers — reject non-finite or out-of-range values with `HTTP 400 { error: "invalid_input", message: <permitted range> }`; pass a valid value (or `undefined`) to `videoRenderer.start`
+  - [x] 15.5 In `useRenderJob.ts`, accept an optional `targetDurationSeconds` and include it in the `POST /api/render` JSON body; update the hook's param types/TSDoc and effect dependencies
+  - [x] 15.6 In `VideoExport.tsx`, add a duration selector (range/number input) bounded by `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds`, defaulted sensibly, with an accessible `<label>`; pass the chosen value into `useRenderJob`
+  - [x] 15.7 Extend `tests/renderer.test.ts`: `calculateSecondsPerSlide` with an explicit in-range target, the 1s-per-slide floor, and the default (no-target) path
+  - [x] 15.8 Add `tests/routes.test.ts`: out-of-range target → 400 `invalid_input` with no SSE stream; non-numeric target → 400; in-range target → render proceeds; absent target → derived default
+
+- [x] 16. End-to-end validation for both features
+  - [x] 16.1 Run `npm test`; ensure new and existing suites pass and `src/server/` coverage stays ≥ 80%
+  - [x] 16.2 Run `npm run build`; verify zero TypeScript errors across frontend and backend
+  - [x] 16.3 Grep to confirm no inline literals for the new governed constants (`8`, `20`) or duration bounds leaked outside `src/config/output.ts`
+  - [x] 16.4 Verify Property 3 (updated ordering incl. run slide) and Property 7 (Target Duration Is Range-Bounded) hold against the implementation
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    {
+      "id": 0,
+      "tasks": ["13.1", "13.2", "13.3", "13.4", "13.5"]
+    },
+    {
+      "id": 1,
+      "tasks": [
+        "14.1", "14.2", "14.3", "14.4", "14.5",
+        "15.1", "15.2", "15.3", "15.4", "15.5", "15.6"
+      ]
+    },
+    {
+      "id": 2,
+      "tasks": ["14.6", "15.7", "15.8"]
+    },
+    {
+      "id": 3,
+      "tasks": ["16.1", "16.2", "16.3", "16.4"]
+    }
+  ]
+}
+```
+
+## Notes
+
+- Wave 0 is the only shared prerequisite: both features depend on the config keys and union members landing first (per output-constants.md §2.3, config follows requirements, which are already merged). Task 13.4 keeps api-error-handling.md's code table in sync with the new `invalid_input` code.
+- Wave 1 is fully parallel: Feature A touches only `storyboard.ts`; Feature B touches `renderer.ts`, `routes.ts`, `useRenderJob.ts`, and `VideoExport.tsx`. There is no file overlap between the two features, so 14.x and 15.x can proceed simultaneously.
+- Wave 2 is the test-authoring pass for both features (kept separate from implementation so a failing test points at implementation, not scaffolding).
+- Component boundaries are unchanged: README section extraction is pure string work and stays in `storyboard.ts`; no new GitHub calls are added to `analyzer.ts`; duration validation lives in `routes.ts` and duration math in `renderer.ts`.
+- The `invalid_input` validation must run before `res.flushHeaders()` so the error never rides the SSE channel (design.md Error Handling flow).
+
+---
+
+# Implementation Plan: Repository-Focused Storyboard
+
+## Overview
+
+Reworks the storyboard around the narrative **What is it? → What can I do with it? → How do I run it? → How does it work? → What are its key features? → How has it evolved?** (Requirements 2, 3, 5, 6, 7 and 4.15–4.16; design.md §2, §3, §5, Properties 3, 4, 8–14).
+
+- Current-state content (overview, capabilities, run, architecture, how-it-works, features) comes from README first, specs second, never from history (Req 3.13).
+- Evolution (timeline, PR/release deep dives, commit highlights) is capped at `maxEvolutionSlides`, relevance-gated by Anchor_Terms, and never padded. Repositories with no Anchor_Terms get only the narrow `feat:` commit fallback (Req 7.14).
+- The renderer gains measured-width wrapping so the prose-heavy slides render correctly.
+
+This plan supersedes the slide ordering from tasks 4.8 and 14.5 (run slide after architecture) and the `"spec"` slide type from 4.5. Existing run-slide extraction (14.1–14.4) and target-duration work (15.x) are reused unchanged.
+
+## Tasks
+
+- [x] 17. Foundation — config, types, fixtures
+  - [x] 17.1 In `src/config/output.ts`, set `SLIDE_CONFIG.introMaxWords` to 120 and add `capabilitiesMaxItems`, `capabilityMaxWords`, `capabilitiesMaxOverlapRatio`, `maxFeatureSlides`, `featureMaxWords`, `maxEvolutionSlides`, `maxEvolutionItems`, `minEvolutionItems`, `changeContextMaxWords`, `relevanceMinTermLength`, and `maxFallbackHighlights` with the values in output-constants.md
+  - [x] 17.2 In `src/types/index.ts`, add `subject`/`body` to `Commit` (keep `message` as an alias of `subject`), and add `PullRequest`, `Release`, `RepoMetadata`, and `ChangeCategory`; extend `RepoAnalysisResult` with `metadata`, `pullRequests`, `releases`
+  - [x] 17.3 Update `SlideType`: rename `"spec"` → `"howItWorks"`; add `"capabilities"`, `"feature"`, `"evolution"`, `"change"`; update doc comments
+  - [x] 17.4 Type-check. Expected errors are limited to consumers updated in wave 1 (`analyzer.ts`, `storyboard.ts`) and test fixtures (`cache.test.ts`, `integration.test.ts`, `storyboard.test.ts`); record the list and treat anything else as a defect
+  - [x] 17.5 Create `tests/fixtures/` with typed `RepoAnalysisResult` fixtures: `kiroRepo` (README Features/How it works/Installation sections, `.kiro/specs` requirements + design, releases incl. a patch release, labeled PRs incl. bot/docs/bump/bug-fix noise), `readmeOnlyRepo` (README with Features, commits only), `thinRepo` (one-line README, mixed `feat:`/`fix:`/`chore:`/`Add …` commits), and `hostileRepo` (HTML metacharacters in every text field)
+
+- [x] 18. Repository analyzer (`analyzer.ts`)
+  - [x] 18.1 Implement `fetchMetadata(owner, repo): Promise<RepoMetadata>` (`GET /repos/{o}/{r}`); make its 404 / non-rate-limit 403 the `repo_not_found` source in `analyzeRepository`
+  - [x] 18.2 Change `fetchDirectoryTree` to return both the 3-level `DirectoryNode[]` and the unfiltered blob list (internal type)
+  - [x] 18.3 Replace `fetchSpecDocs` with `selectSpecPaths(blobs)` (prefix/extension/segment validation, requirements/design priority, ascending-path ties, `MAX_SPEC_FILES` = 6, > 1 MB skipped) and `fetchSpecDocs(owner, repo, paths)` (per-segment `encodeURIComponent`, `contents` endpoint, raw Accept, host assertion)
+  - [x] 18.4 Map commits to `subject` + `body` (leading blank lines trimmed)
+  - [x] 18.5 Implement `fetchPullRequests(owner, repo): Promise<PullRequest[]>` — merged only, lowercased labels, `isBot`, body capped at `MAX_CHANGE_BODY_CHARS`; 404 → `[]`
+  - [x] 18.6 Implement `fetchReleases(owner, repo): Promise<Release[]>` — drafts dropped, body capped; 404 → `[]`
+  - [x] 18.7 Rework `analyzeRepository`: steps 1–4, 6, 7 via `Promise.allSettled`; spec step after tree (skipped and recorded when tree fails); new `partialFailures` names; empty sources never recorded; rate-limit rethrow unchanged
+  - [x] 18.8 Update `tests/analyzer.test.ts`: replace `.kiro` directory-listing tests with spec-selection tests (4-level paths, priority, cap, size, invalid/traversal paths, encoding); add metadata, PR, release, commit-body, empty-vs-failure, and tree-failure-skips-specs cases
+
+- [x] 19. Storyboard — current-state sections (`storyboard.ts`)
+  - [x] 19.1 Make `makeSlide` escape `title`, `body`, and `previewSummary` itself; refactor all existing builders to pass raw text (fixes the unescaped conclusion preview)
+  - [x] 19.2 Add shared helpers `findSection`, `listItems`, `firstSentences`, `toPlainText`; re-implement run-section lookup on `findSection` with unchanged behaviour
+  - [x] 19.3 Rewrite the overview slide: name + description + topics + first README prose paragraph (skip heading/badge/image/HTML/blank lines) ≤ `introMaxWords`; fallback text
+  - [x] 19.4 Implement Capabilities extraction (README headings, then spec user-story `I want` clauses) ≤ `capabilitiesMaxItems` / `capabilityMaxWords`; "Usage" excluded
+  - [x] 19.5 Implement how-it-works (README `How it works|Architecture|Design`, then design.md-first spec fallback reusing the former spec-slide logic) as type `"howItWorks"`
+  - [x] 19.6 Implement Key_Feature extraction (README list items with name/description parsing, then design Components subheadings, then requirement titles) and slide building: described → individual slides, name-only → one summary slide, total ≤ `maxFeatureSlides`
+  - [x] 19.7 Implement the Capabilities/Key_Feature overlap check (> `capabilitiesMaxOverlapRatio` → omit Capabilities slide)
+  - [x] 19.8 Extend the conclusion slide with stars, language, and license from metadata
+
+- [x] 20. Storyboard — evolution and assembly (`storyboard.ts`)
+  - [x] 20.1 Implement `GENERIC_TERMS`, `buildAnchorTerms` (current-state inputs only), and `isRelevant` with prefix matching
+  - [x] 20.2 Implement `extractChangeContext` (strip HTML comments, task lists, headings, code fences, trailers; plain text; first sentence; ≤ `changeContextMaxWords`)
+  - [x] 20.3 Implement PR significance (7.1), category precedence (7.2), and ranking (7.3)
+  - [x] 20.4 Implement patch-release detection and release timeline / deep-dive eligibility
+  - [x] 20.5 Implement commit highlights: relevant path (7.9, Bug Fix excluded, PR-reference dedup) and empty-anchor fallback (7.14, `^feat(\([^)]*\))?!?:` only, dependency wording excluded, ≤ `maxFallbackHighlights`)
+  - [x] 20.6 Implement evolution allocation: timeline only when ≥ `minEvolutionItems` eligible entries (≤ `maxEvolutionItems`, chronological), then PR deep dives, release deep dives, highlights; stop at `maxEvolutionSlides` or when candidates run out — never pad
+  - [x] 20.7 Rewrite `generateStoryboard` stage 5: new ordering (run after capabilities or overview), trim guard in the 3.4 order, `minSlides` guard
+
+- [x] 21. Renderer text layout (`renderer.ts`)
+  - [x] 21.1 Move layout literals into a module-level `LAYOUT` constant and add a single `decodeHtmlEntities` helper
+  - [x] 21.2 Implement pure `wrapText(text, maxWidth, measure)` (explicit breaks preserved, greedy word wrap, long-word character breaking)
+  - [x] 21.3 Implement `fitLines(lines, maxLines, maxWidth, measure)` with measured ellipsis; title limited to `LAYOUT.titleMaxLines`
+  - [x] 21.4 Use both in `renderSlideFrames`, positioning divider and body from the rendered title height
+  - [x] 21.5 Add `wrapText`/`fitLines`/title tests to `tests/renderer.test.ts` using a fake `measure`
+
+- [x] 22. Storyboard and integration tests
+  - [x] 22.1 Update existing `tests/storyboard.test.ts` cases broken by the redesign (overview paragraph + 120-word limit, `"spec"` → `"howItWorks"`, run-slide position, ordering, raw-in/escaped-out builders)
+  - [x] 22.2 Current-state section tests: README → spec fallbacks, "Usage" not a capability, overlap threshold boundaries, feature individual vs. summary slides and cap
+  - [x] 22.3 Evolution tests: PR filters/categories/ranking, patch releases, timeline min/cap/chronology, Bug Fix timeline-only, release deep dives only on PR shortfall, relevant-commit path, empty-anchor `feat:` fallback accept/reject cases, PR-reference dedup
+  - [x] 22.4 Property tests on the four fixtures: ordering (P3), no fabrication (P8), ceilings with metamorphic noise injection (P9), anchoring and fallback (P10), escaping for every slide type (P11), non-redundant capabilities (P12), history invariance (P14)
+  - [x] 22.5 Update `tests/cache.test.ts` and `tests/integration.test.ts` fixtures to the new `RepoAnalysisResult` shape; add an integration flow per fixture shape and a PR-step-failure partial-data flow
+
+- [x] 23. End-to-end validation
+  - [x] 23.1 Run `npm test`; all suites pass, `src/server/` coverage ≥ 80%
+  - [x] 23.2 Run `npm run build`; zero TypeScript errors across frontend and backend
+  - [x] 23.3 Grep for inline literals of every governed constant (incl. `120`, `0.5`, and the new caps) outside `src/config/output.ts`
+  - [x] 23.4 Manual end-to-end: drive the real `generateStoryboard` → real `/api/storyboard` and `/api/render` routes for all four fixtures with only the analyzer fetch boundary and ffmpeg stubbed; confirm slide order, evolution counts below the caps where noise dominates, the thin-repo `feat:` fallback, and escaping
+  - [x] 23.5 Visual check: render one frame per slide type from `kiroRepo` via `renderSlideFrames`, inspect the PNGs for wrapping, title truncation, and body ellipsis; delete the images afterwards
+  - [x] 23.6 Record a verification table for Properties 1–14
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    {
+      "id": 0,
+      "tasks": ["17.1", "17.2", "17.3", "17.4"]
+    },
+    {
+      "id": 1,
+      "tasks": [
+        "17.5",
+        "18.1", "18.2", "18.3", "18.4", "18.5", "18.6", "18.7",
+        "19.1", "19.2", "19.3", "19.4", "19.5", "19.6", "19.7", "19.8",
+        "21.1", "21.2", "21.3", "21.4"
+      ]
+    },
+    {
+      "id": 2,
+      "tasks": [
+        "20.1", "20.2", "20.3", "20.4", "20.5", "20.6", "20.7",
+        "18.8",
+        "21.5"
+      ]
+    },
+    {
+      "id": 3,
+      "tasks": ["22.1", "22.2", "22.3", "22.4", "22.5"]
+    },
+    {
+      "id": 4,
+      "tasks": ["23.1", "23.2", "23.3", "23.4", "23.5", "23.6"]
+    }
+  ]
+}
+```
+
+## Notes
+
+- Wave 0 changes shared types, so the type-check in 17.4 is expected to fail in known consumers until wave 1 lands. The failure list is recorded, not fixed, in wave 0.
+- Wave 1 runs three independent tracks in parallel: analyzer (18.x), storyboard current-state sections (19.x), and renderer layout (21.1–21.4). They touch different files. Fixtures (17.5) only depend on the wave 0 types.
+- Wave 2 holds the storyboard evolution work (20.x) because it shares `storyboard.ts` with 19.x and needs 19.x's extracted sections for anchors and assembly. Analyzer tests (18.8) and renderer tests (21.5) run alongside it.
+- Wave 3 is the storyboard and integration test pass. It depends on the full `generateStoryboard` from 20.7.
+- Component boundaries are unchanged: all GitHub calls stay in `analyzer.ts`; all section matching, relevance, allocation, and ordering stay in `storyboard.ts`; layout stays in `renderer.ts`. No new network hosts.
+- All `max*` slide constants are ceilings (output-constants.md §2.4). Tests must assert "at most", plus the metamorphic check that ineligible input never adds slides.
+- `GENERIC_TERMS` is algorithm data defined in design.md, not a governed constant.
+
+## Correctness Properties Verification (Repository-Focused Storyboard)
+
+| # | Property | Result | Evidence |
+|---|----------|--------|----------|
+| 1 | URL Validation Is Server-Authoritative | PASS | analyzer URL tests; `analyzeRepository` validates before any fetch |
+| 2 | Output Constants Are Immutable at Runtime | PASS | `tests/config.test.ts`; governed-literal scan clean |
+| 3 | Slide Ordering Invariant | PASS | property test on all 4 fixtures; run-slide position tests |
+| 4 | Partial Extraction Does Not Abort | PASS | analyzer tests: failing step recorded, tree failure records specDocs, 404/[] sources not recorded |
+| 5 | Render Job Isolation | PASS | existing renderer path tests (unchanged) |
+| 6 | Cancellation Is Time-Bounded | PASS | existing abort tests (unchanged) |
+| 7 | Target Duration Is Range-Bounded | PASS | `tests/routes.test.ts`; manual e2e 400 + in-range render per fixture |
+| 8 | Content Is Never Fabricated | PASS | corpus-substring property test on all 4 fixtures |
+| 9 | Slide Caps Are Ceilings | PASS | cap assertions + metamorphic noise injection on all 4 fixtures |
+| 10 | Evolution Anchored / feat Fallback | PASS | property test + fallback accept/reject cases |
+| 11 | Escaping for Every Slide Type | PASS | hostile fixtures cover all 10 slide types |
+| 12 | Capabilities Not Redundant | PASS | ratio boundary tests + per-fixture property |
+| 13 | Text Stays Within Slide Bounds | PASS | `wrapText`/`fitLines`/`layoutSlide` tests; real-canvas visual check |
+| 14 | History Never Defines Current Capabilities | PASS | history-swap property test on all 4 fixtures |
+
+Full suite: 292 tests across 7 files; `src/server/` coverage 92.62%. Mutation checks (unescaped title, `Add …` accepted by fallback, anchors fed from commits, bug-fix deep dives, unrelated release deep dives) each made the storyboard tests fail.
