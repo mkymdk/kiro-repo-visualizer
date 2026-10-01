@@ -187,7 +187,7 @@ Run against the completed implementation:
 
 Two independent extensions to the existing pipeline:
 
-- **Feature A — "How to run this repository" slide** (Requirements 3.9–3.13). A new `"run"` slide type extracted from the already-fetched README section (Installation / Getting Started / Setup / Usage / Quick Start), assembled purely in `storyboard.ts`, positioned after architecture and before highlights. No new GitHub calls, no repository code execution.
+- **Feature A — "How to run this repository" slide** (Requirements 5.7–5.11). A new `"run"` slide type extracted from the already-fetched README section (Installation / Getting Started / Setup / Usage / Quick Start), assembled purely in `storyboard.ts`, positioned after architecture and before highlights. No new GitHub calls, no repository code execution.
 - **Feature B — user-selectable video duration** (Requirements 4.10–4.14). A user-chosen `Target_Duration` within `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`, validated pre-SSE in `routes.ts` (new `invalid_input` / HTTP 400 code), threaded through `useRenderJob` and `VideoExport`, consumed by `calculateSecondsPerSlide`.
 
 The two features share only the config/type foundation (wave 0) and the final verification (last wave). Their feature-specific work does not cross modules, so it runs in parallel.
