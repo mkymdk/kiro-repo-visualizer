@@ -54,16 +54,37 @@ vi.mock("fluent-ffmpeg", () => {
         em.on(ev, fn);
         return cmd;
       },
+      ffmpegProc: undefined as (EventEmitter & { exitCode: number | null; signalCode: string | null }) | undefined,
+      kill(sig: string) {
+        // A killed child exits right away here; tests/cancellation.test.ts scripts exit separately.
+        const proc = cmd.ffmpegProc;
+        if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+        setTimeout(() => {
+          proc.signalCode = sig;
+          proc.emit("exit", null, sig);
+          em.emit("error", new Error(`ffmpeg was killed with signal ${sig}`));
+        }, 0);
+      },
       run() {
         ffmpegState.runCalledAt = Date.now();
+        const proc = Object.assign(new EventEmitter(), { exitCode: null as number | null, signalCode: null as string | null });
+        cmd.ffmpegProc = proc;
+        em.emit("start", "ffmpeg (scripted)");
         for (const raw of ffmpegState.script) {
           const e = raw as ScriptEvent;
           setTimeout(() => {
+            if (proc.exitCode !== null || proc.signalCode !== null) return;
             if (e.event === "progress") em.emit("progress", { frames: e.frames });
             else if (e.event === "end") {
               fs.writeFileSync(outPath, "mp4");
+              proc.exitCode = 0;
+              proc.emit("exit", 0, null);
               em.emit("end");
-            } else em.emit("error", new Error(e.message));
+            } else {
+              proc.exitCode = 1;
+              proc.emit("exit", 1, null);
+              em.emit("error", new Error(e.message));
+            }
           }, e.at);
         }
       },
@@ -283,12 +304,16 @@ describe("heartbeat cleanup", () => {
       onTick: async (t, r) => {
         if (abortedAt === null && t >= 4_000) {
           abortedAt = t;
-          await r.abort([...r.jobs.keys()][0]!);
+          // Not awaited: cancellation waits for confirmed exit, which needs fake time to advance.
+          void r.abort([...r.jobs.keys()][0]!);
         }
       },
     });
     expect(abortedAt).not.toBeNull();
     expect(result.emissions.some((e) => e.t <= abortedAt!)).toBe(true);
+    expect(result.emissions.filter((e) => e.t > abortedAt!)).toEqual([]);
+    // Let the script's own late "end" timer fire (it is ignored after the kill), then nothing may remain.
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(result.emissions.filter((e) => e.t > abortedAt!)).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
   });

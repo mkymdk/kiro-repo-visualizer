@@ -195,6 +195,9 @@ router.post(
         validatedDuration = value;
       }
 
+      // The job exists (and is cancellable) before any rendering work (Req 4.19).
+      const created = videoRenderer.createJob();
+
       // Set SSE headers before writing any data
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
@@ -202,7 +205,18 @@ router.post(
       res.flushHeaders();
       res.on("close", () => {
         closed = true;
+        // Disconnect cancels only a job that is still active (Req 4.21);
+        // a terminal job, e.g. one that just completed, is left unchanged.
+        const current = videoRenderer.jobs.get(created.id);
+        if (current && (current.status === "pending" || current.status === "rendering")) {
+          videoRenderer.cancel(created.id).catch((cancelErr: unknown) => {
+            console.error("[routes] cancellation after disconnect failed:", cancelErr);
+          });
+        }
       });
+
+      // First event: the job ID, before any frame work.
+      res.write(`data: ${JSON.stringify({ jobId: created.id, percent: 0 })}\n\n`);
 
       const onProgress = (percent: number): void => {
         if (!closed && !res.writableEnded) {
@@ -210,11 +224,19 @@ router.post(
         }
       };
 
-      const job = await videoRenderer.start(
+      const job = await videoRenderer.run(
+        created.id,
         slides as Slide[],
         onProgress,
         validatedDuration,
       );
+
+      // Cancelled: end the stream quietly, with no 100 and no error (Req 4.18).
+      if (job.status !== "complete") {
+        closed = true;
+        if (!res.writableEnded) res.end();
+        return;
+      }
 
       // The single terminal event (Req 4.17).
       if (!closed && !res.writableEnded) {
@@ -258,7 +280,13 @@ router.post(
 // ---------------------------------------------------------------------------
 
 /**
- * Cancel an in-progress render job and delete the partial output file.
+ * Cancel a render job (idempotent, Req 4.8, 4.22).
+ *
+ * Unknown job → 404. A pending or rendering job is cancelled through the
+ * shared `cancel()` path, and 204 is returned once the cancellation contract
+ * is met. A job already in a Terminal_State → 204 with no change; a complete
+ * job's MP4 is kept. A cancellation-termination failure (encoder exit not
+ * confirmed in time) is passed to the error handler as `internal_error`.
  */
 router.delete(
   "/render/:jobId",
@@ -279,7 +307,7 @@ router.delete(
         return;
       }
 
-      await videoRenderer.abort(jobId);
+      await videoRenderer.cancel(jobId);
       res.status(204).end();
     } catch (err: unknown) {
       next(err);

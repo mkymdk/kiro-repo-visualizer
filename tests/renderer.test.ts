@@ -184,7 +184,7 @@ describe("calculateSecondsPerSlide", () => {
 // VideoRenderer.abort — cleanup and state
 // ---------------------------------------------------------------------------
 
-describe("VideoRenderer.abort", () => {
+describe("VideoRenderer.abort / cancel (pending jobs; encoder paths in tests/cancellation.test.ts)", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -196,65 +196,43 @@ describe("VideoRenderer.abort", () => {
     );
   });
 
-  it("sets job status to cancelled", async () => {
+  it("cancels a pending job: status cancelled, no encoder needed", async () => {
     const renderer = new VideoRenderer();
-    // Manually insert a job record
-    const jobId = "test-job-id";
-    renderer.jobs.set(jobId, {
-      id: jobId,
-      status: "rendering",
-      outputPath: null,
-      fileSizeBytes: null,
-      errorMessage: null,
-      sizeWarning: false,
-      completedAtMs: null,
-    });
-    await renderer.abort(jobId);
-    expect(renderer.jobs.get(jobId)?.status).toBe("cancelled");
+    const job = renderer.createJob();
+    expect(job.status).toBe("pending");
+    await renderer.abort(job.id);
+    expect(renderer.jobs.get(job.id)?.status).toBe("cancelled");
   });
 
   it("deletes the partial output file if it exists", async () => {
-    // Use a real temp file so we can verify deletion without mocking fs internals
     const { writeFileSync, existsSync } = await import("fs");
     const renderer = new VideoRenderer();
-    const jobId = "test-job-file-delete";
-    const outputPath = path.join(os.tmpdir(), `${jobId}.mp4`);
-
-    // Create a real temp file
-    writeFileSync(outputPath, "partial data");
-    expect(existsSync(outputPath)).toBe(true);
-
-    renderer.jobs.set(jobId, {
-      id: jobId,
-      status: "rendering",
-      outputPath,
-      fileSizeBytes: null,
-      errorMessage: null,
-      sizeWarning: false,
-      completedAtMs: null,
-    });
-
-    await renderer.abort(jobId);
-    expect(existsSync(outputPath)).toBe(false);
+    const job = renderer.createJob();
+    writeFileSync(job.outputPath!, "partial data");
+    expect(existsSync(job.outputPath!)).toBe(true);
+    await renderer.cancel(job.id);
+    expect(existsSync(job.outputPath!)).toBe(false);
   });
 
   it("completes within cancelTimeoutSeconds", async () => {
     const renderer = new VideoRenderer();
-    const jobId = "timeout-test";
-    renderer.jobs.set(jobId, {
-      id: jobId,
-      status: "rendering",
-      outputPath: null,
-      fileSizeBytes: null,
-      errorMessage: null,
-      sizeWarning: false,
-      completedAtMs: null,
-    });
-
+    const job = renderer.createJob();
     const start = Date.now();
-    await renderer.abort(jobId);
-    const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(VIDEO_CONFIG.cancelTimeoutSeconds * 1000 + 100);
+    await renderer.cancel(job.id);
+    expect(Date.now() - start).toBeLessThan(VIDEO_CONFIG.cancelTimeoutSeconds * 1000);
+  });
+
+  it("is a no-op for a terminal job and keeps a complete job's file", async () => {
+    const { writeFileSync, existsSync, rmSync } = await import("fs");
+    const renderer = new VideoRenderer();
+    const job = renderer.createJob();
+    writeFileSync(job.outputPath!, "finished video");
+    job.status = "complete";
+    await renderer.cancel(job.id);
+    await renderer.cancel(job.id);
+    expect(job.status).toBe("complete");
+    expect(existsSync(job.outputPath!)).toBe(true);
+    rmSync(job.outputPath!, { force: true });
   });
 });
 
