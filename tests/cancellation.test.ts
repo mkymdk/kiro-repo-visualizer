@@ -385,6 +385,33 @@ describe("Property 6: cancellation terminates the encoder within the timeout", (
     }
   });
 
+  it("no progress is emitted after cancellation, even while ffmpeg still reports progress before exiting", async () => {
+    // SIGTERM exit is delayed so the encoder keeps reporting frames during cancellation.
+    ff.exitOn.SIGTERM = KILL_GRACE_MS - 100;
+    ff.script = [
+      { at: 0, event: "partial" },
+      // Fired after cancellation starts (cancel begins at ≈ one progress interval).
+      { at: VIDEO_CONFIG.progressIntervalMs + 200, event: "progress", frames: 10 },
+      { at: VIDEO_CONFIG.progressIntervalMs + 400, event: "progress", frames: 20 },
+      { at: 60_000, event: "end" },
+    ];
+    const r = startRender(2);
+    await until(() => ff.runCalledAt !== null);
+    // Let the heartbeat emit at least once so the test proves emissions were live.
+    await advance(VIDEO_CONFIG.progressIntervalMs);
+    const beforeCancel = r.emissions.length;
+    expect(beforeCancel).toBeGreaterThan(0);
+
+    const c = startCancel(r.renderer, r.job.id);
+    await until(() => c.done && r.settled.done);
+    await advance(VIDEO_CONFIG.progressIntervalMs * 2);
+    expect(c.ok).toBe(true);
+    expect(r.emissions.length).toBe(beforeCancel);
+    expect(r.emissions).not.toContain(100);
+    expect(r.settled.value?.status).toBe("cancelled");
+    expect(r.job.errorMessage).toBeNull();
+  });
+
   it("no timers or exit listeners remain after cancellation settles", async () => {
     ff.exitOn.SIGTERM = 5;
     ff.script = [];
