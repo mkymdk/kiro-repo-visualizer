@@ -532,6 +532,19 @@ Branch and commit plan:
 - Probes stopped there to save quota, per the cheap-probe rule.
 - Completed live runs: this repository (PR #9, one slot, 0 lookups) and `chalk/chalk` (0 lookups, no regression), both with the heartbeat bound met.
 - A qualifying repository needs README feature terms **and** merge-commit PRs with history beyond 50 commits. Candidate search is follow-up F4.
+- **Bounded F4 attempt (second pass):** four candidates were pre-screened with no core API quota (README read from `raw.githubusercontent.com`, through the real extractor, plus one commit-search request each). Only the two with anchor terms were then probed, analysis only, 6 requests each:
+
+  | Candidate | Pre-screen | Probe result | Why it does not exercise the path |
+  |---|---|---|---|
+  | `jesseduffield/lazygit` | 0 anchor terms | not probed | No PR can be selected |
+  | `Textualize/rich` | 0 anchor terms | not probed | No PR can be selected |
+  | `httpie/cli` | 24 anchor terms | 0 merge commits in window, 0 merged PRs | No merge-commit Selected_PR |
+  | `encode/httpx` | 58 anchor terms | 2 Selected_PRs, 0 merge commits in window | Selected PRs' merge commits are outside the 50-commit window (Req 7.16), so they need no lookup |
+
+  The search stopped there, as required. 27.7 stays **incomplete** and F4 stays open. The missing live path is covered by automated tests:
+  - `tests/storyboard.test.ts`: the "truncated merge-commit PR" Property 15 test (graph-only keeps 2 highlights; evidence suppresses both), `prsNeedingEvidence` tests, and window-soundness and evidence-independence tests.
+  - `tests/analyzer.test.ts`: `fetchSelectedPrCommits` bounds, endpoint, and failure isolation.
+  - `tests/pipeline.test.ts`: 1–3 truncated merge-commit Selected_PRs through the real route, with exactly N lookups, highlights suppressed, ≤ 15 requests, 0 on a cache hit, and failure falling back to graph-only.
 
 ## Task Dependency Graph
 
@@ -585,7 +598,7 @@ Branch and commit plan:
 - **F1. Cancellation lifecycle.** (a) `VideoRenderer.abort()` does not terminate the ffmpeg process: it marks the job cancelled and deletes the output file, but encoding keeps running. (b) The UI receives the job ID only with the final SSE event, so it cannot send `DELETE /api/render/:jobId` for an active render. Fix both together. Tasks 24–27 only make sure `abort()` releases the progress timer.
 - **F2. Graph-only grouping beyond the 50-commit window.** Graph-proven membership stops at the window, so merge commits in long-history repositories group only themselves (live: every merge commit in `rails/rails` and `kubernetes/kubernetes`). Selected_PRs are now covered by exact PR-commit lookup. The remaining gap is commits of merge-style PRs that are **not** selected: two commits from the same unselected PR may still each get a highlight. Closing it would mean more lookups beyond Selected_PRs, which needs a separate budget decision.
 - **F3. Rebase-merged PRs.** Only the last rebased commit is linked to its PR (Req 7.18). The PR-commit endpoint returns the pre-rebase SHAs, which don't match the base branch (single-parent merges verified 0/1 on `chalk/chalk` and `systemd/systemd`). This stays a limitation unless a multi-commit rebase merge is shown to keep exact SHAs. No message-based workaround.
-- **F4. Live validation of the selected-PR lookup on a long-history repository.** Find a public repository with README features or capabilities (so PRs can be selected) and merge-commit PRs whose history extends beyond the 50-commit window, then run task 27.7's success criteria. The three suggested candidates don't qualify (no Anchor_Terms).
+- **F4. Live validation of the selected-PR lookup on a long-history repository.** Find a public repository with README features or capabilities (so PRs can be selected) and merge-commit PRs whose history extends beyond the 50-commit window, then run task 27.7's success criteria. The three suggested candidates don't qualify (no Anchor_Terms). A bounded second attempt (`lazygit`, `rich`, `httpie/cli`, `encode/httpx`) also found none; see the 27.7 status note. The combination is uncommon: repositories with a README features section tend to squash-merge or have merge commits older than their last 50 commits.
 - **Deferred live-validation issues 3–12:**
   - 3: patch-release detection misses prefixed tags.
   - 4: release Change_Context and release-vs-PR duplication.
