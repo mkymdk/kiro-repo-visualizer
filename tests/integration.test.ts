@@ -32,7 +32,22 @@ vi.mock("../src/server/renderer.js", () => {
     videoRenderer: {
       jobs,
       start: vi.fn(),
+      run: vi.fn(),
+      cancel: vi.fn(async () => {}),
       abort: vi.fn(),
+      createJob: vi.fn(() => {
+        const job = {
+          id: "job-1",
+          status: "pending",
+          outputPath: "/tmp/job-1.mp4",
+          fileSizeBytes: null,
+          errorMessage: null,
+          sizeWarning: false,
+          completedAtMs: null,
+        };
+        jobs.set(job.id, job);
+        return job;
+      }),
     },
     buildOutputPath: vi.fn((id: string) => `/tmp/${id}.mp4`),
   };
@@ -345,11 +360,11 @@ describe("DELETE /api/render/:jobId", () => {
 
   beforeEach(() => {
     app = buildApp();
-    vi.mocked(videoRenderer.abort).mockReset();
+    vi.mocked(videoRenderer.cancel).mockReset();
   });
 
   it("returns 404 when job is not found", async () => {
-    vi.mocked(videoRenderer.abort).mockRejectedValue(
+    vi.mocked(videoRenderer.cancel).mockRejectedValue(
       new ApiError("internal_error", "Job not found."),
     );
     // jobs Map is empty from the mock
@@ -368,7 +383,7 @@ describe("DELETE /api/render/:jobId", () => {
       sizeWarning: false,
       completedAtMs: null,
     });
-    vi.mocked(videoRenderer.abort).mockResolvedValue(undefined);
+    vi.mocked(videoRenderer.cancel).mockResolvedValue(undefined);
 
     const res = await request(app).delete(`/api/render/${jobId}`);
     expect(res.status).toBe(204);
@@ -742,7 +757,7 @@ describe("full flow per repository shape", () => {
   beforeEach(() => {
     app = buildApp();
     vi.mocked(analyzeRepository).mockReset();
-    vi.mocked(videoRenderer.start).mockReset();
+    vi.mocked(videoRenderer.run).mockReset();
   });
 
   it.each(Object.entries(ALL_FIXTURES))("%s: analyze → storyboard → render → download", async (_name, fixture) => {
@@ -764,7 +779,7 @@ describe("full flow per repository shape", () => {
     const path = await import("path");
     const jobId = `flow-${fixture.repo}`;
     const outputPath = path.default.join(os.default.tmpdir(), `${jobId}.mp4`);
-    vi.mocked(videoRenderer.start).mockImplementation(async (received: Slide[]) => {
+    vi.mocked(videoRenderer.run).mockImplementation(async (_id: string, received: Slide[]) => {
       expect(received).toEqual(slides);
       writeFileSync(outputPath, "mp4");
       const job = {

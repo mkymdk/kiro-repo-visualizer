@@ -474,90 +474,310 @@ function yieldToEventLoop(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/** Statuses that never change again (Req 4.20). */
+const TERMINAL_STATES: ReadonlySet<RenderJobStatus> = new Set(["complete", "failed", "cancelled"]);
+
+/** Allowed status transitions of the Render_Job state machine. */
+const ALLOWED_TRANSITIONS: Readonly<Record<RenderJobStatus, readonly RenderJobStatus[]>> = {
+  pending: ["rendering", "cancelled"],
+  rendering: ["complete", "failed", "cancelled"],
+  complete: [],
+  failed: [],
+  cancelled: [],
+};
+
+/**
+ * Compare-and-set a job's status (the only way to change `job.status`).
+ *
+ * @param job - The job to update.
+ * @param from - Statuses the job must currently be in.
+ * @param to - The new status; must be an allowed transition from the current one.
+ * @returns True when the status was changed.
+ */
+export function transition(job: RenderJob, from: readonly RenderJobStatus[], to: RenderJobStatus): boolean {
+  if (!from.includes(job.status) || !ALLOWED_TRANSITIONS[job.status].includes(to)) return false;
+  job.status = to;
+  return true;
+}
+
+/** True when the job is in a Terminal_State. */
+export function isTerminal(job: RenderJob): boolean {
+  return TERMINAL_STATES.has(job.status);
+}
+
+/**
+ * Time after the cancellation request at which `SIGKILL` replaces `SIGTERM`.
+ * Half of the cancellation deadline, leaving room to confirm exit and delete the file.
+ */
+export const KILL_GRACE_MS = (VIDEO_CONFIG.cancelTimeoutSeconds * 1000) / 2;
+
+/** The subset of fluent-ffmpeg's command used for cancellation. */
+interface KillableCommand {
+  kill(signal: string): unknown;
+  ffmpegProc?: ChildProcessLike;
+}
+
+/** The subset of a child process observed for confirmed exit. */
+interface ChildProcessLike {
+  once(event: "exit", listener: () => void): unknown;
+  removeListener(event: "exit", listener: () => void): unknown;
+  exitCode: number | null;
+  signalCode: string | null;
+}
+
+/** Observes confirmed exit of the encoder process for one job. */
+class EncoderExit {
+  /** The fluent-ffmpeg command, once `run()` was called. */
+  command: KillableCommand | null = null;
+  /** The spawned child process, once fluent-ffmpeg emitted `start`. */
+  private child: ChildProcessLike | null = null;
+  /** Signal to deliver as soon as the child spawns (cancellation before spawn). */
+  private pendingSignal: string | null = null;
+  private exitedFlag = false;
+  private readonly waiters = new Set<() => void>();
+  private childListener: (() => void) | null = null;
+
+  /** Whether an encoder was started (`run()` called). */
+  get started(): boolean {
+    return this.command !== null;
+  }
+
+  /** Whether exit has been confirmed. */
+  get exited(): boolean {
+    return this.exitedFlag;
+  }
+
+  /**
+   * Record the spawned child and observe its own `exit` event.
+   *
+   * @param child - The child process (`command.ffmpegProc`).
+   */
+  attachChild(child: ChildProcessLike | undefined): void {
+    if (!child || this.child) return;
+    this.child = child;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      this.markExited();
+      return;
+    }
+    this.childListener = () => this.markExited();
+    child.once("exit", this.childListener);
+    if (this.pendingSignal) this.signal(this.pendingSignal);
+  }
+
+  /**
+   * fluent-ffmpeg reported `end`/`error`. That confirms exit only when no
+   * child ever spawned; otherwise the child's own `exit` event is authoritative.
+   */
+  commandSettled(): void {
+    if (this.child === null) this.markExited();
+  }
+
+  /**
+   * Send a signal to the encoder, or queue it until the child spawns.
+   *
+   * @param sig - `SIGTERM` or `SIGKILL`.
+   */
+  signal(sig: string): void {
+    if (this.exitedFlag || !this.command) return;
+    if (!this.child) {
+      this.pendingSignal = sig;
+      return;
+    }
+    this.command.kill(sig);
+  }
+
+  /**
+   * Wait until exit is confirmed or `ms` elapses.
+   *
+   * @param ms - Maximum wait in milliseconds.
+   * @returns True when exit was confirmed.
+   */
+  waitForExit(ms: number): Promise<boolean> {
+    if (this.exitedFlag) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        this.waiters.delete(done);
+        resolve(this.exitedFlag);
+      };
+      const timer = setTimeout(done, Math.max(0, ms));
+      this.waiters.add(done);
+    });
+  }
+
+  /**
+   * Run a callback once exit is confirmed, without any timer. Used to keep a
+   * surviving process observed after a cancellation-termination failure.
+   *
+   * @param cb - Called once on confirmed exit.
+   */
+  onExit(cb: () => void): void {
+    if (this.exitedFlag) {
+      cb();
+      return;
+    }
+    this.exitCallbacks.push(cb);
+  }
+
+  private readonly exitCallbacks: (() => void)[] = [];
+
+  private markExited(): void {
+    if (this.exitedFlag) return;
+    this.exitedFlag = true;
+    if (this.child && this.childListener) this.child.removeListener("exit", this.childListener);
+    this.childListener = null;
+    for (const w of [...this.waiters]) w();
+    for (const cb of this.exitCallbacks.splice(0)) cb();
+  }
+}
+
+/** Per-job record of a job that has not settled yet. */
+interface ActiveRender {
+  tracker: ProgressTracker;
+  controller: AbortController;
+  encoder: EncoderExit;
+  /** The in-flight cancellation, shared by concurrent callers. */
+  cancelling: Promise<void> | null;
+}
+
+/**
+ * Delete a file if present, never throwing.
+ *
+ * @param filePath - The file to remove.
+ * @returns The error, if removal failed for a reason other than absence.
+ *
+ * @remarks
+ * Removes a file from `os.tmpdir()` as a side effect.
+ */
+function removeFileQuietly(filePath: string | null): Error | null {
+  if (!filePath) return null;
+  try {
+    fs.rmSync(filePath, { force: true });
+    return null;
+  } catch (err: unknown) {
+    return err instanceof Error ? err : new Error(String(err));
+  }
+}
+
 /**
  * Singleton-style video renderer that manages render job lifecycle.
  *
- * Each job is stored in an in-memory `Map` keyed by UUID. Jobs write their
- * output to `os.tmpdir()/<jobId>.mp4`.
+ * Each job is stored in an in-memory `Map` keyed by UUID and moves through
+ * the guarded state machine `pending → rendering → complete | failed |
+ * cancelled` (`pending → cancelled` also allowed). Jobs write their output
+ * to `os.tmpdir()/<jobId>.mp4`.
  */
 export class VideoRenderer {
   /** In-memory store of all render jobs keyed by job UUID. */
   public readonly jobs: Map<string, RenderJob> = new Map();
 
-  /** Progress trackers of jobs that are still rendering, keyed by job UUID. */
-  private readonly trackers: Map<string, ProgressTracker> = new Map();
+  /** Records of jobs that have not settled yet, keyed by job UUID. */
+  private readonly active: Map<string, ActiveRender> = new Map();
 
   /**
-   * Start a new video render job for the given slides.
+   * Create and register a pending job. No rendering work is done.
    *
-   * Renders each slide to a PNG frame sequence, then pipes the frames to
-   * ffmpeg for H.264/MP4 encoding. A {@link ProgressTracker} emits progress
-   * every {@link HEARTBEAT_MS} during both phases; ffmpeg reports only update
-   * the stored value. The tracker is stopped on success, failure, and
-   * {@link VideoRenderer.abort}. The terminal 100 event is the caller's.
-   *
-   * @param slides - The ordered array of {@link Slide} objects to render.
-   * @param onProgress - Callback invoked on every heartbeat with a
-   *   non-decreasing percent value in 0–99.
-   * @param targetDurationSeconds - Optional target total video duration in
-   *   seconds, distributed across the slides. When omitted, a default is
-   *   derived from the slide count. Expected to be within
-   *   `[VIDEO_CONFIG.minDurationSeconds, VIDEO_CONFIG.maxDurationSeconds]`
-   *   (validated by the route before this method is called).
-   * @returns The completed {@link RenderJob} record.
-   * @throws {@link ApiError} With code `internal_error` if rendering fails.
-   *
-   * @remarks
-   * Writes one MP4 file to `os.tmpdir()`. The file is the caller's
-   * responsibility to delete after download (see `VideoRenderer.abort` and
-   * the download route's `res.on("finish")` handler).
+   * @returns The new {@link RenderJob}, whose `id` can be exposed immediately (Req 4.19).
    */
-  async start(
-    slides: Slide[],
-    onProgress: ProgressCallback,
-    targetDurationSeconds?: number,
-  ): Promise<RenderJob> {
-    const jobId = randomUUID();
-    const outputPath = buildOutputPath(jobId);
-
+  createJob(): RenderJob {
+    const id = randomUUID();
     const job: RenderJob = {
-      id: jobId,
-      status: "pending" as RenderJobStatus,
-      outputPath,
+      id,
+      status: "pending",
+      outputPath: buildOutputPath(id),
       fileSizeBytes: null,
       errorMessage: null,
       sizeWarning: false,
       completedAtMs: null,
     };
-    this.jobs.set(jobId, job);
+    this.jobs.set(id, job);
+    this.active.set(id, {
+      tracker: new ProgressTracker(() => {}),
+      controller: new AbortController(),
+      encoder: new EncoderExit(),
+      cancelling: null,
+    });
+    return job;
+  }
+
+  /**
+   * Create a job and run it (compatibility wrapper for {@link createJob} + {@link run}).
+   *
+   * @param slides - The ordered slides to render.
+   * @param onProgress - Heartbeat callback (non-decreasing 0–99).
+   * @param targetDurationSeconds - Optional validated target duration in seconds.
+   * @returns The settled job (`complete` or `cancelled`).
+   * @throws {@link ApiError} With code `internal_error` if the job fails.
+   *
+   * @remarks
+   * Writes one MP4 file to `os.tmpdir()`.
+   */
+  async start(slides: Slide[], onProgress: ProgressCallback, targetDurationSeconds?: number): Promise<RenderJob> {
+    return this.run(this.createJob().id, slides, onProgress, targetDurationSeconds);
+  }
+
+  /**
+   * Render a pending job: frame preparation, then H.264/MP4 encoding.
+   *
+   * A {@link ProgressTracker} emits progress every {@link HEARTBEAT_MS} during
+   * both phases; ffmpeg reports only update the stored value. The terminal
+   * 100 event is the caller's. Frame preparation checks the job's abort
+   * signal after each slide. Completion and failure go through the guarded
+   * state machine, so a cancelled job is never completed or failed.
+   *
+   * @param jobId - A job created by {@link createJob}.
+   * @param slides - The ordered slides to render.
+   * @param onProgress - Heartbeat callback (non-decreasing 0–99).
+   * @param targetDurationSeconds - Optional validated target duration in seconds.
+   * @returns The settled job: `complete`, or `cancelled` (also returned
+   *   immediately for a job cancelled while pending).
+   * @throws {@link ApiError} With code `internal_error` if the job is unknown,
+   *   not pending, or fails (the partial output is deleted first, Req 4.7).
+   *
+   * @remarks
+   * Writes one MP4 file to `os.tmpdir()`; deletes it on failure.
+   */
+  async run(
+    jobId: string,
+    slides: Slide[],
+    onProgress: ProgressCallback,
+    targetDurationSeconds?: number,
+  ): Promise<RenderJob> {
+    const job = this.jobs.get(jobId);
+    const record = this.active.get(jobId);
+    if (!job) throw new ApiError("internal_error", `Render job ${jobId} not found.`);
+    if (job.status === "cancelled") return job;
+    if (!record || !transition(job, ["pending"], "rendering")) {
+      throw new ApiError("internal_error", `Render job ${jobId} is not pending.`);
+    }
 
     const tracker = new ProgressTracker(onProgress);
-    this.trackers.set(jobId, tracker);
+    record.tracker = tracker;
+    const { signal } = record.controller;
+    const outputPath = job.outputPath!;
 
     try {
-      job.status = "rendering";
       tracker.start();
-      const secondsPerSlide = calculateSecondsPerSlide(
-        slides.length,
-        targetDurationSeconds,
-      );
+      const secondsPerSlide = calculateSecondsPerSlide(slides.length, targetDurationSeconds);
 
-      // Render all frames, yielding after each slide so the heartbeat can fire.
+      // Frame preparation, stopping at the next slide boundary once aborted.
       const allFrames: Buffer[] = [];
       for (let i = 0; i < slides.length; i++) {
+        if (signal.aborted) return job;
         allFrames.push(...renderSlideFrames(slides[i]!, secondsPerSlide));
         tracker.update(((i + 1) / slides.length) * FRAME_PHASE_WEIGHT);
         await yieldToEventLoop();
       }
+      if (signal.aborted) return job;
 
       const totalFrames = allFrames.length;
-
       await new Promise<void>((resolve, reject) => {
         const command = Ffmpeg();
+        record.encoder.command = command as unknown as KillableCommand;
 
-        // Pipe frames through a PassThrough stream
         const { PassThrough } = require("stream") as typeof import("stream");
         const frameStream = new PassThrough();
+        signal.addEventListener("abort", () => frameStream.destroy(), { once: true });
 
         command
           .input(frameStream)
@@ -572,6 +792,9 @@ export class VideoRenderer {
             "-movflags", "+faststart",
           ])
           .output(outputPath)
+          .on("start", () => {
+            record.encoder.attachChild((command as unknown as KillableCommand).ffmpegProc);
+          })
           .on("progress", (progress: { frames?: number }) => {
             // ffmpeg's encoded-frame count only updates the stored value; the
             // heartbeat timer alone decides when progress is emitted.
@@ -582,105 +805,141 @@ export class VideoRenderer {
             }
           })
           .on("error", (err: Error) => {
+            record.encoder.commandSettled();
             reject(err);
           })
           .on("end", () => {
+            record.encoder.commandSettled();
             resolve();
           })
           .run();
 
-        // Push frames into the stream while respecting backpressure. Writing
-        // hundreds of full-resolution PNG buffers in a tight synchronous loop
-        // ignores the `false` returned by write() when the internal buffer is
-        // full, buffering every frame in memory at once and producing a
-        // truncated/corrupt MP4. Instead, pause on backpressure and resume on
-        // the stream's "drain" event so ffmpeg consumes at its own pace.
+        // Push frames while respecting backpressure; stop once aborted.
         (async () => {
           try {
             for (const frame of allFrames) {
+              if (signal.aborted) return;
               const hasCapacity = frameStream.write(frame);
               if (!hasCapacity) {
-                await new Promise<void>((resolveDrain) =>
-                  frameStream.once("drain", resolveDrain),
-                );
+                await new Promise<void>((resolveDrain) => {
+                  // Resume on drain, or on close after an abort; remove both listeners either way.
+                  const done = (): void => {
+                    frameStream.removeListener("drain", done);
+                    frameStream.removeListener("close", done);
+                    resolveDrain();
+                  };
+                  frameStream.once("drain", done);
+                  frameStream.once("close", done);
+                });
               }
             }
             frameStream.end();
           } catch (writeErr: unknown) {
-            frameStream.destroy(
-              writeErr instanceof Error ? writeErr : undefined,
-            );
-            reject(
-              writeErr instanceof Error
-                ? writeErr
-                : new Error("Failed to write frames to the encoder."),
-            );
+            if (signal.aborted) return;
+            frameStream.destroy(writeErr instanceof Error ? writeErr : undefined);
+            reject(writeErr instanceof Error ? writeErr : new Error("Failed to write frames to the encoder."));
           }
         })();
       });
 
-      // Record file size
+      // Completion: guarded so a cancelled job is never completed (Req 4.20).
+      if (job.status !== "rendering") return job;
       const stat = fs.statSync(outputPath);
       job.fileSizeBytes = stat.size;
       job.sizeWarning = stat.size > VIDEO_CONFIG.maxFileSizeBytes;
-      job.status = "complete";
       job.completedAtMs = Date.now();
+      if (!transition(job, ["rendering"], "complete")) {
+        job.fileSizeBytes = null;
+        job.sizeWarning = false;
+        job.completedAtMs = null;
+      }
+      return job;
     } catch (err: unknown) {
-      job.status = "failed";
-      job.errorMessage =
-        err instanceof Error ? err.message : "Unknown render error";
+      // Cancellation won: the encoder's error is the expected result of the kill.
+      if (!transition(job, ["rendering"], "failed")) return job;
+      // Failure (Req 4.7): delete the partial output; no signal is sent.
+      job.errorMessage = err instanceof Error ? err.message : "Unknown render error";
+      const cleanupError = removeFileQuietly(outputPath);
+      if (cleanupError) {
+        console.error(`[renderer] job ${jobId}: failed to delete partial output: ${cleanupError.message}`);
+      }
       throw new ApiError("internal_error", job.errorMessage);
     } finally {
-      // Release the heartbeat on success, failure, and cancellation alike.
-      // The route sends the single terminal 100 event (Req 4.17).
+      // Release the heartbeat on every outcome. The route sends the single 100 (Req 4.17).
       tracker.stop();
-      this.trackers.delete(jobId);
+      if (record.cancelling === null) this.active.delete(jobId);
     }
-
-    return job;
   }
 
   /**
-   * Abort an in-progress render job, kill ffmpeg, and delete the partial file.
+   * Cancel a job: the single cancellation implementation (DELETE, client
+   * disconnect, internal callers). Idempotent; concurrent callers share one
+   * in-flight cancellation, and a job in a Terminal_State is left unchanged.
    *
-   * Waits up to `VIDEO_CONFIG.cancelTimeoutSeconds` seconds for cleanup to
-   * complete before resolving.
+   * Sequence: claim `cancelled` → stop progress → abort frame work →
+   * `SIGTERM` → wait for confirmed exit → `SIGKILL` at {@link KILL_GRACE_MS}
+   * → wait for confirmed exit until `VIDEO_CONFIG.cancelTimeoutSeconds` →
+   * delete the partial output.
    *
-   * @param jobId - The UUID of the render job to cancel.
-   * @throws {@link ApiError} With code `internal_error` if no job with the
-   *   given ID is found.
+   * @param jobId - The job to cancel.
+   * @throws {@link ApiError} With code `internal_error` if the job is unknown,
+   *   or if the encoder's exit could not be confirmed by the deadline
+   *   (cancellation-termination failure; the job still stays cancelled).
    *
    * @remarks
-   * Deletes the partial MP4 output file from `os.tmpdir()` as a side effect.
+   * Sends signals to the ffmpeg child process and deletes the partial MP4
+   * from `os.tmpdir()`.
    */
-  async abort(jobId: string): Promise<void> {
+  async cancel(jobId: string): Promise<void> {
     const job = this.jobs.get(jobId);
-    if (!job) {
-      throw new ApiError("internal_error", `Render job ${jobId} not found.`);
+    if (!job) throw new ApiError("internal_error", `Render job ${jobId} not found.`);
+    const record = this.active.get(jobId);
+    if (record?.cancelling) return record.cancelling;
+    if (!record || !transition(job, ["pending", "rendering"], "cancelled")) return;
+
+    record.cancelling = this.runCancellation(job, record).finally(() => {
+      this.active.delete(jobId);
+    });
+    return record.cancelling;
+  }
+
+  /** Alias of {@link VideoRenderer.cancel}, kept for existing callers. */
+  async abort(jobId: string): Promise<void> {
+    return this.cancel(jobId);
+  }
+
+  /** Steps 2–8 of the cancellation sequence for a job already marked cancelled. */
+  private async runCancellation(job: RenderJob, record: ActiveRender): Promise<void> {
+    const deadline = Date.now() + VIDEO_CONFIG.cancelTimeoutSeconds * 1000;
+    const graceAt = Date.now() + KILL_GRACE_MS;
+    record.tracker.stop();
+    record.controller.abort();
+
+    const { encoder } = record;
+    let confirmed = true;
+    if (encoder.started) {
+      encoder.signal("SIGTERM");
+      confirmed = await encoder.waitForExit(graceAt - Date.now());
+      if (!confirmed) {
+        encoder.signal("SIGKILL");
+        confirmed = await encoder.waitForExit(deadline - Date.now());
+      }
     }
 
-    job.status = "cancelled";
+    const cleanupError = removeFileQuietly(job.outputPath);
+    if (cleanupError) {
+      console.error(`[renderer] job ${job.id}: failed to delete partial output: ${cleanupError.message}`);
+    }
 
-    // Stop progress reporting for this job (Req 4.18). ffmpeg termination is
-    // unchanged here (follow-up F1).
-    this.trackers.get(jobId)?.stop();
-    this.trackers.delete(jobId);
-
-    // Attempt to delete the partial output file
-    if (job.outputPath) {
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, VIDEO_CONFIG.cancelTimeoutSeconds * 1000);
-        try {
-          if (fs.existsSync(job.outputPath!)) {
-            fs.unlinkSync(job.outputPath!);
-          }
-        } catch {
-          // Best-effort cleanup
-        } finally {
-          clearTimeout(timeout);
-          resolve();
-        }
+    if (!confirmed) {
+      const message = `Cancellation-termination failure: encoder exit for job ${job.id} not confirmed within ${VIDEO_CONFIG.cancelTimeoutSeconds}s.`;
+      job.errorMessage = message;
+      console.error(`[renderer] ${message}`);
+      // Keep observing the surviving process so its late exit is still recorded.
+      encoder.onExit(() => {
+        console.warn(`[renderer] job ${job.id}: encoder exited after the cancellation deadline.`);
       });
+      throw new ApiError("internal_error", message);
     }
   }
 

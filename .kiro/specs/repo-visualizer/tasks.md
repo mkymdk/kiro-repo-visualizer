@@ -595,7 +595,7 @@ Branch and commit plan:
 
 ## Follow-ups (not in this cycle)
 
-- **F1. Cancellation lifecycle.** (a) `VideoRenderer.abort()` does not terminate the ffmpeg process: it marks the job cancelled and deletes the output file, but encoding keeps running. (b) The UI receives the job ID only with the final SSE event, so it cannot send `DELETE /api/render/:jobId` for an active render. Fix both together. Tasks 24–27 only make sure `abort()` releases the progress timer.
+- **F1. Cancellation lifecycle.** (a) `VideoRenderer.abort()` does not terminate the ffmpeg process: it marks the job cancelled and deletes the output file, but encoding keeps running. (b) The UI receives the job ID only with the final SSE event, so it cannot send `DELETE /api/render/:jobId` for an active render. Fix both together. Tasks 24–27 only make sure `abort()` releases the progress timer. **Resolved** by the Render Cancellation Lifecycle plan (tasks 28–31, Properties 6 and 18).
 - **F2. Graph-only grouping beyond the 50-commit window.** Graph-proven membership stops at the window, so merge commits in long-history repositories group only themselves (live: every merge commit in `rails/rails` and `kubernetes/kubernetes`). Selected_PRs are now covered by exact PR-commit lookup. The remaining gap is commits of merge-style PRs that are **not** selected: two commits from the same unselected PR may still each get a highlight. Closing it would mean more lookups beyond Selected_PRs, which needs a separate budget decision.
 - **F3. Rebase-merged PRs.** Only the last rebased commit is linked to its PR (Req 7.18). The PR-commit endpoint returns the pre-rebase SHAs, which don't match the base branch (single-parent merges verified 0/1 on `chalk/chalk` and `systemd/systemd`). This stays a limitation unless a multi-commit rebase merge is shown to keep exact SHAs. No message-based workaround.
 - **F4. Live validation of the selected-PR lookup on a long-history repository.** Find a public repository with README features or capabilities (so PRs can be selected) and merge-commit PRs whose history extends beyond the 50-commit window, then run task 27.7's success criteria. The three suggested candidates don't qualify (no Anchor_Terms). A bounded second attempt (`lazygit`, `rich`, `httpie/cli`, `encode/httpx`) also found none; see the 27.7 status note. The combination is uncommon: repositories with a README features section tend to squash-merge or have merge commits older than their last 50 commits.
@@ -610,3 +610,138 @@ Branch and commit plan:
   - 10: duration rounding remainder.
   - 11: emoji shortcodes and near-duplicate overview text.
   - 12: no category for performance changes.
+
+---
+
+# Implementation Plan: Render Cancellation Lifecycle (Candidate A, resolves F1)
+
+## Overview
+
+A correctness fix for the existing cancellation requirements (Req 4.7, 4.8, 4.18–4.22; Properties 6, 18).
+
+Today `abort()` deletes the output file but never stops ffmpeg. The encode keeps running, a late `end` overwrites `cancelled` with `complete` and recreates a downloadable MP4, and the UI can't cancel, because it only learns the job ID from the final event. Failed renders also leave their partial output (Req 4.7).
+
+**Correction to earlier verification tables:** previous Property 6 "PASS" rows were verified only by file deletion and elapsed time. Process termination, frame-loop stop, and late-completion protection were never tested.
+
+Out of scope: Candidates B–D, and retrying or resuming cancelled renders.
+
+Commit plan, on a new branch `fix/render-cancellation-lifecycle` from `main`:
+1. `docs:` specs.
+2. `fix:` renderer and route lifecycle.
+3. `fix:` UI cancel.
+
+No push without approval.
+
+## Tasks
+
+- [x] 28. Job state machine and renderer API (`renderer.ts`, `types/index.ts`)
+  - [x] 28.1 Add the guarded `transition(job, from, to)` compare-and-set and route every status change through it. Allowed: `pending→rendering`, `pending→cancelled`, `rendering→{complete, failed, cancelled}`. Terminal states have no outgoing transitions.
+  - [x] 28.2 Split the API into `createJob()` (pending, registered, no work) and `run(jobId, slides, onProgress, target?)`. `run` resolves on `complete`/`cancelled`, rejects only on `failed`, and returns immediately for a job cancelled while pending. Keep `start()` as a `createJob` + `run` wrapper.
+  - [x] 28.3 Active-render record `{ tracker, controller, command, exited, cancelling }`. The frame loop checks `controller.signal.aborted` after each slide. Keep a handle to the ffmpeg command and its child process. Settle `exited` only from the child process's own `exit` event; fluent-ffmpeg's `end` or `error` counts only when no child was ever spawned. A sent signal never settles `exited`.
+  - [x] 28.4 Single `cancel(jobId)`, with `abort` as an alias:
+    1. Compare-and-set to `cancelled`, so completion can no longer win.
+    2. Stop the tracker.
+    3. `controller.abort()`.
+    4. `SIGTERM`.
+    5. Wait for exit.
+    6. `SIGKILL` at `KILL_GRACE_MS = cancelTimeoutSeconds × 1000 / 2` if ffmpeg hasn't exited.
+    7. Wait for **confirmed exit**: the child process's `exit` event, not the signal call, until the deadline.
+    8. Delete the partial file.
+    9. Resolve; if exit wasn't confirmed by the deadline, reject with a cancellation-termination failure (job stays `cancelled`, file still deleted, the late exit still observed). A pending job with no encoder resolves without signals.
+
+    Concurrent callers share the in-flight promise; terminal jobs return immediately.
+
+    Deadline (Req 4.8, Property 6): for an active encoder, sending `SIGTERM` or `SIGKILL` is not sufficient. Actual exit must be observed within `VIDEO_CONFIG.cancelTimeoutSeconds`. If it isn't, the job stays terminal `cancelled` and non-downloadable, the termination failure is logged, and Property 6 fails for that execution even though `cancel()` returned and the partial file was deleted.
+  - [x] 28.5 Completion uses compare-and-set `rendering→complete`. If it fails, nothing is recorded and the job stays `cancelled`. Failure uses `rendering→failed` and deletes the partial output (Req 4.7) without signalling the encoder. An unlink error is logged; the original error stays the reported failure, with no second transition.
+
+- [x] 29. Route lifecycle (`routes.ts`)
+  - [x] 29.1 `POST /api/render`:
+    - `createJob()` after validation, open SSE, write `{"jobId","percent":0}` first, then `run()`.
+    - `complete`: one terminal 100. `cancelled`: end quietly, with no 100 and no error. `failed`: one error event.
+  - [x] 29.2 `res.on("close")`: set `closed`. If the job is still pending or rendering, call `cancel(jobId)` (shared path). If it's terminal, change nothing.
+  - [x] 29.3 `DELETE`: 404 for an unknown job (unchanged). Otherwise `await cancel(jobId)` then 204. A terminal job is a no-op 204 and never deletes a complete job's file.
+  - [x] 29.4 Confirm download serves only `complete` and returns 409 for every other state.
+
+- [x] 30. UI cancel (`useRenderJob.ts`, `VideoExport.tsx`)
+  - [x] 30.1 Hook: take the job ID from the first event. `cancel()` sends `DELETE` first, then closes the stream. Don't treat a quiet stream end after cancellation as a failure.
+  - [x] 30.2 Disable the Cancel button until a job ID is known; enable it while rendering.
+
+- [x] 31. Tests and validation
+  - [x] 31.1 New `tests/cancellation.test.ts` (fake timers; scripted ffmpeg with recorded `kill(signal)` and scripted exit):
+    - Signals vs. exit: the scripted ffmpeg records `kill(signal)` separately from a scripted process `exit`. `SIGTERM` sent; when the process exits after it, `SIGKILL` is never sent (race 7); when it doesn't, `SIGKILL` is sent at `KILL_GRACE_MS` and exit is observed before the deadline (race 8). When exit never comes, `cancel()` rejects at the deadline, the job stays `cancelled`, the file is deleted, and download returns 409.
+    - Frame loop stops mid-way; partial file deleted; `cancel()` resolves within `cancelTimeoutSeconds`.
+    - Final state `cancelled`, and it stays `cancelled` when `end` arrives during cancellation (race 2) or `error` arrives after `SIGTERM`/`SIGKILL` (race 3).
+    - Concurrent `cancel()` calls run cleanup once.
+    - Cancel while pending: `run` does no work.
+    - Repeated cancel after `cancelled` (race 5) and cancel after `complete` keeps the MP4 (race 6).
+    - Req 4.7 regression: partial output exists, rendering fails, the job becomes `failed`, the output is deleted, download is rejected, no signal is sent. An unlink error keeps the original failure.
+    - No timers or listeners left.
+  - [x] 31.2 Route tests (`tests/routes.test.ts`, integration):
+    - The job ID event comes first.
+    - Cancel ends the stream with no 100 and no error event.
+    - Disconnect while rendering calls the shared `cancel`.
+    - Completion just before close leaves the job `complete` (race 4).
+    - `DELETE` and disconnect nearly simultaneous produce one cleanup and a 204 (race 1).
+    - Repeated `DELETE` returns 204.
+    - `DELETE` after `complete` keeps the file and download still works.
+    - Download of `cancelled`/`failed` returns 409.
+    - Unknown-job `DELETE` returns 404.
+  - [x] 31.3 Hook/UI test: the Cancel button is disabled before the job ID arrives, then sends `DELETE` during rendering.
+  - [x] 31.4 Update existing tests for the `createJob`/`run` split and the routes mock. Properties 1–17 must still pass.
+  - [x] 31.5 Type-check (0 errors), full suite, build, governed-literal scan (`KILL_GRACE_MS` derived from `cancelTimeoutSeconds`), `git diff --check`, traceability (Req 4 numbered 1–22, Properties 1–18).
+  - [x] 31.6 Mutation checks, each of which must fail tests:
+    - no `kill`;
+    - no `SIGKILL` escalation;
+    - `SIGKILL` sent unconditionally;
+    - completion without compare-and-set;
+    - no frame-loop abort;
+    - disconnect not cancelling;
+    - disconnect cancelling a terminal job;
+    - `DELETE` deleting a complete file;
+    - no job-ID-first event;
+    - error event on cancel.
+  - [x] 31.7 One local manual end-to-end run with real ffmpeg (no GitHub): start a render, cancel it mid-encode through `DELETE`, record the ffmpeg child PID, then confirm the process is no longer alive (`process.kill(pid, 0)` → `ESRCH`), the file is deleted, the status is `cancelled`, and download returns 409.
+  - [x] 31.8 Fill the verification table, clean up temporary files, commit as planned.
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    { "id": 0, "tasks": ["28.1", "28.2", "28.3"] },
+    { "id": 1, "tasks": ["28.4", "28.5"] },
+    { "id": 2, "tasks": ["29.1", "29.2", "29.3", "29.4", "30.1", "30.2"] },
+    { "id": 3, "tasks": ["31.1", "31.2", "31.3", "31.4"] },
+    { "id": 4, "tasks": ["31.5", "31.6", "31.7", "31.8"] }
+  ]
+}
+```
+
+## Notes
+
+- One cancellation implementation (`cancel`) serves `DELETE`, client disconnect, and internal paths. Neither route duplicates the cleanup logic.
+- `KILL_GRACE_MS` is derived from the governed `cancelTimeoutSeconds`; no new governed constants.
+- Cancellation records stay in `jobs` so repeated `DELETE` returns 204. Sweeping old cancelled/failed records is not part of this change.
+- No GitHub API usage in this cycle.
+
+**Mutation checks (31.6):** 17 of 18 caught.
+- Caught: progress tracker not stopped on cancellation; no `kill`; no `SIGKILL` escalation; `SIGKILL` sent unconditionally; signal treated as exit; completion with no state check; no frame-loop abort; failure keeps partial output; termination failure not surfaced; no shared cancellation; `DELETE` deleting a complete file; disconnect not cancelling; disconnect cancelling a terminal job; no job-ID-first event; error event on cancel; UI aborting before `DELETE`.
+- Not caught: replacing the completion compare-and-set alone. The `job.status !== "rendering"` check immediately before it guards the same synchronous region, so the compare-and-set is defense in depth that no single-threaded interleaving can reach.
+
+## Correctness Properties Verification (Render Cancellation Lifecycle)
+
+| # | Property | Result | Evidence |
+|---|----------|--------|----------|
+| 1–5, 7–17 | Unchanged properties | PASS | Full suite: 393 tests across 11 files (existing tests updated only for the `createJob`/`run` split and the job-ID-first event) |
+| 6 | Cancellation Terminates Rendering Within the Timeout | PASS | `tests/cancellation.test.ts`, with signals recorded separately from the child's `exit`:
+- races 7/8: `SIGTERM` only when it exits; `SIGKILL` at `KILL_GRACE_MS` with exit observed before `T`;
+- cancellation not settled while a signal is sent but exit not observed;
+- no exit by `T`: rejects as a cancellation-termination failure, job stays `cancelled`, file deleted;
+- frame loop stops (< 15 canvases), output deleted, late `end`/`error` can't resurrect the job (races 2, 2b, 3);
+- no progress emitted after cancellation, even while ffmpeg still reports frames before exiting;
+- download 409; Req 4.7 failure cleanup.
+
+PASS rests on the observed child `exit` event, not on `cancel()` returning or the file being deleted.
+
+Real ffmpeg (31.7, re-run on the final code): child PID alive and encoding (12%) before `DELETE`. `SIGTERM` sent 37 ms after the request; the child's own `exit` event fired at 78 ms (code 255), within the 3,000 ms deadline, so no `SIGKILL` was needed. Afterwards the PID was gone (`process.kill(pid, 0)` → `ESRCH`, no `/proc` entry, 0 ffmpeg processes for the job). `DELETE` 204 in 83 ms, file gone, status `cancelled`, 0 active records, download 409, repeated `DELETE` 204, no resources left after the server closed. |
+| 18 | Render Job Lifecycle Has One Outcome | PASS | Guarded-transition matrix test; job ID first, written before `run()` starts; quiet stream end on cancel; disconnect while pending or rendering → shared `cancel()`; disconnect after complete/failed → no change (race 4); `DELETE` + disconnect share one cancellation and neither settles before exit (race 1); repeated `DELETE` 204 (race 5); `DELETE` after complete keeps the MP4 and download still works (race 6); unknown → 404; termination failure → structured 500; UI: Cancel enabled only with a job ID, `DELETE` sent before the stream closes. Real run: first event `{jobId, percent: 0}`, no event after cancel, no 100, no error, stream ended |
