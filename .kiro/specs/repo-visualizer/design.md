@@ -160,7 +160,7 @@ Shared helpers:
 |---|---|---|---|---|
 | Overview (`intro`) | Repo name + `metadata.description` + `metadata.topics` + first README prose paragraph (skips heading, badge/image, HTML, and blank lines) | Name + "No description available." | `introMaxWords` | never |
 | Capabilities (`capabilities`) | README section `Capabilities \| What it does \| What you can do \| Use Cases` → list items, else sentences | Spec user stories: the `I want …` clause of `As a …, I want …, so that …` lines (a leading `**User Story:**` is stripped), document order | `capabilitiesMaxItems`, `capabilityMaxWords` | no source, or overlap > `capabilitiesMaxOverlapRatio` (see below) |
-| Run (`run`) | README section `Installation \| Getting Started \| Setup \| Usage \| Quick Start` (unchanged) | — | `runMaxSteps`, `runMaxWordsPerStep` | no match |
+| Run (`run`) | README section `Install \| Installation \| Getting Started \| Setup \| Usage \| Quick Start \| Example \| Examples` (first match in document order; see Extraction quality, B4) | — | `runMaxSteps`, `runMaxWordsPerStep` | no match |
 | Architecture (`architecture`) | Top-level tree, directories first (unchanged) | Placeholder text | — | never |
 | How it works (`howItWorks`) | README section `How it works \| Architecture \| Design` → heading + sentences | Spec docs, `design.md` preferred: title, headings, sentences from design/architecture/decision sections (existing spec-slide logic) | `specMaxHeadings`, `specMaxSentences` | no source |
 | Key features (`feature`) | README section `Features \| Key Features \| Highlights` → list items parsed as `**Name** — desc`, `**Name**: desc`, `Name: desc`, or `Name - desc` | design.md `…Components…` section subheadings + first sentence; then `Requirement N: Title` headings (name only) | `maxFeatureSlides`, `featureMaxWords` | no source |
@@ -176,6 +176,7 @@ Shared helpers:
 `buildAnchorTerms(capabilities, features, howItWorksHeadings): Set<string>`
 - Tokenize on non-alphanumerics, lowercase, and keep tokens with length ≥ `relevanceMinTermLength`.
 - Drop tokens in `GENERIC_TERMS`, a fixed module-level list of words that would make everything "relevant". It includes common English function words (`with`, `from`, `that`, `this`, `into`, `your`, `using`, `when`, `what`, `which`), change verbs (`added`, `adds`, `update`, `updates`, `change`, `changes`, `improve`, `implement`, `implementation`, `refactor`, `redesign`, `support`, `supports`, `allow`, `allows`, `make`, `makes`), and structural nouns (`feature`, `features`, `system`, `user`, `users`, `architecture`, `design`, `overview`, `usage`, `works`, `project`, `repository`).
+- Drop Calendar_Terms (`isCalendarTerm`; see Extraction quality, B5). This list is separate from `GENERIC_TERMS`.
 - Match rule: `a === b || a.startsWith(b) || b.startsWith(a)`, so "render" matches "renderer".
 
 `isRelevant(text, anchors)` tokenizes `text` the same way and returns true on any match.
@@ -304,6 +305,89 @@ interface Slide {
   previewSummary: string; // HTML-escaped, ≤ previewMaxWords words
 }
 ```
+
+#### Extraction quality (Req 3.14, 5.7, 5.12, 7.19–7.22)
+
+Six narrow fixes, all inside `storyboard.ts`. Each policy is its own small pure helper with its own tests; there is no shared `sanitizeText()`. The analyzer, `pipeline.ts`, routes, and GitHub request counts are unchanged.
+
+| Item | Helper (new or changed) | Called from | Stage |
+|---|---|---|---|
+| B1 | `parseSemanticVersionTag(tag)` (new), `isPatchRelease` (changed) | `planEvolution` | release classification |
+| B2 | `cleanReleaseNotes(body)` (new) | release loop in `buildEvolutionSlides` → `extractChangeContext` | before Change_Context |
+| B3 | `isDocsCommit(subject)` (new) | `selectHighlightCommits`, before `take()` | highlight eligibility |
+| B4 | `RUN_HEADING_RE` (changed), `headingKey` (changed) | `buildRunSlide` → `findSection` | heading match |
+| B5 | `isCalendarTerm(token)` (new) | `relevanceTokens` | relevance tokenization |
+| B6a | `stripEmojiShortcodes(text)` (new) | `makeSlide`, `headingKey`, `releaseTitle`, B6b | slide output |
+| B6b | `overviewKey(text, repo)` (new), `dedupeParagraph(paragraph, description, repo)` (new) | `buildIntroSlide` | overview assembly |
+
+**B1. Patch-release classification (Req 7.19, Glossary Semantic_Version_Tag / Patch_Release).**
+- *Current failure:* `isPatchRelease` matches `^v?(\d+)\.(\d+)\.(\d+)` at the start of the tag only, so `release-v1.2.3` and `yargs-parser-v20.2.9` count as milestones, while `1.2.3.4` and `2024.01.15` count as patches. Classification lives only in `storyboard.ts`; the analyzer drops drafts and nothing else, and `Release` has no `prerelease` field.
+- *Rule:* `parseSemanticVersionTag(tag)` returns `{ major, minor, patch, prerelease, build } | null` in four conservative steps, with no prerelease-label vocabulary:
+  1. **Boundary:** strip an optional prefix that ends in a separator, then an optional `v`/`V`, using `^(?:.*[-_/@])?[vV]?` anchored at the start. What remains is the version candidate.
+  2. **Core:** the candidate must begin with `X.Y.Z`, each of `X`, `Y`, `Z` being `0|[1-9]\d*` (no leading zeros).
+  3. **Prerelease/build:** any text after the core must be a complete SemVer suffix — an optional `-` prerelease (dot-separated identifiers of `[0-9A-Za-z-]`, numeric identifiers without leading zeros) and an optional `+` build (dot-separated identifiers of `[0-9A-Za-z-]`) — and nothing else. The whole candidate is anchored with `$`.
+  4. **Trailing text:** because step 3 is anchored, any disallowed trailing text (`node-1.2.3-compat`, `support-1.2.3x`, `1.2.3.4`) fails the parse.
+
+  Full pattern after the boundary strip: `^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$`. `isPatchRelease(release)` is `parseSemanticVersionTag(release.tagName) !== null && parsed.patch > 0`; only the core patch component decides exclusion.
+- *Prerelease:* decided by the core, so `v1.2.3-rc.1` and `v1.2.3-api` are patches (excluded), while `v2.0.0-beta.1` and `v1.2.0-rc.1` are not (kept). Build metadata never affects the decision.
+- *False-positive protection:* the version must sit at the permitted boundary and the suffix is fully anchored, so `node-1.2.3-compat`, `support-1.2.3x`, `1.2.3.4`, and `2024.01.15` (leading-zero component) are not semantic versions and stay eligible. Names and notes are never inspected. No SemVer dependency is added; the project has none and this parser needs none.
+- *Fallback:* a tag that doesn't parse is a milestone release (eligible), as a non-semver tag is today.
+- *Accepted limit:* a calendar-style version with no leading zeros (`2024.1.15`) satisfies the tag shape and is classified as a version; see Accepted limitations.
+
+**B2. Release-note cleanup (Req 7.20).**
+- *Current failure:* release deep dives use `extractChangeContext(release.body)`, which keeps list items (marker removed) and joins every kept line. GitHub-generated notes (`* Add x by @u in https://…/pull/12`) therefore become one run-on sentence full of URLs, `@user in` attributions, hashes, and `(#12)` references, cut at `changeContextMaxWords`.
+- *Rule:* `cleanReleaseNotes(body): string` runs before `extractChangeContext`, line by line over `scanLines` output, in this order:
+  1. Skip the bodies of sections whose `headingKey` is `New Contributors`, `Contributors`, `Full Changelog`, or `Checksums` (case-insensitive), up to the next heading of the same or higher level. Skip any line whose plain text starts with `Full Changelog`.
+  2. Replace Markdown links `[text](url)` and reference links with their text.
+  3. Remove the GitHub attribution suffix `by @login` with an optional following `in <url-or-#ref>` at the end of a line.
+  4. Remove autolinks `<https://…>` and bare `https?://\S+` URLs, together with an immediately preceding `in`, `at`, `see`, or `via`.
+  5. Remove standalone commit hashes: whole words of 7–40 hex characters containing at least one digit and at least one letter `a–f`, including a wrapping pair of backticks or parentheses.
+  6. Remove parenthesized reference lists: `(#12)`, `(#12, #13)`, `(owner/repo#12)`, `(GH-12)`.
+  7. Drop empty `()`/`[]`, collapse whitespace, trim leading/trailing `-`, `:`, `,`, and drop lines with no letters left.
+  8. If any remaining line is prose (not a list item), keep prose lines only; otherwise keep only the first remaining list item.
+- *False-positive protection:* inline references in prose (`Fixes a crash introduced in #123.`), versions, numbers, `@mentions` outside the generated suffix, and identifiers such as `sha256` or `0x1f2e3d4c` are kept. Hex-only English words (`deadbeef`, `cafe`) lack a digit and are kept. Only release notes are cleaned; PR and commit bodies keep today's `extractChangeContext` behavior.
+- *Fallback:* when nothing remains, the release has no Change_Context, so no release deep dive is generated (Req 7.6). The timeline entry (title only) is unaffected.
+
+**B3. Documentation-only commits (Req 7.21).**
+- *Current failure:* on the relevance path, `HIGHLIGHT_RE` matches substrings anywhere, and `categoryFromTitle("docs: add guide")` falls through to the keyword `add` → Feature, so `docs:` commits fill highlight slots. `docs!:` becomes Breaking Change. The empty-anchor fallback already accepts only `feat`.
+- *Rule:* `isDocsCommit(subject)` is `/^\s*docs(\([^)]*\))?!?:/i`. `selectHighlightCommits` rejects such commits on both paths **before** `take()`, so a docs commit never claims its Change_Group.
+- *False-positive protection:* only the conventional `docs` type at the start of the subject. `feat: generate docs site`, `Add docs command`, `docsite: …`, and `doc: …` are not docs commits. PR and release eligibility (Req 7.1) are unchanged, and a PR is never affected by the type of its commits.
+- *Fallback:* none needed; other commits fill the slot.
+
+**B4. Run headings (Req 5.7, Glossary Run_Instructions).**
+- *Current failure:* `RUN_HEADING_RE` is `^(installation|getting started|setup|usage|quick start)\b`, so `Install`, `Example`, and `Examples` are missed. `headingKey` strips leading emoji and punctuation but not a leading shortcode, so `:package: Installation` fails.
+- *Rule:* `RUN_HEADING_RE = /^(install|installation|getting started|setup|usage|quick start|examples?)\b/i`, tested against the existing normalized `headingKey`, which becomes `stripEmojiShortcodes` → strip leading non-alphanumerics → strip trailing colon/space. Heading text is already plain text (`toPlainText` removes `**`, links, and code).
+- *Eligible content (unchanged rule, Req 5.8):* the section body runs to the next heading of the same or higher level, so subsections are included. The first fenced code block's non-blank lines are preferred; otherwise the non-blank, non-fence lines. Capped at `runMaxSteps` and `runMaxWordsPerStep`.
+- *Selection:* the first matching section in document order (Req 5.9, unchanged).
+- *False-positive protection:* whole-word prefix match only, so `Installing`, `Instance`, and `Exampleapp` don't match. Other `findSection` callers share `headingKey`; the shortcode strip only adds matches for shortcode-prefixed headings.
+- *Fallback:* no match → no Run slide (Req 5.10).
+
+**B5. Calendar terms (Req 7.22, Glossary Calendar_Term).**
+- *Current failure:* `relevanceTokens` keeps any token of ≥ `relevanceMinTermLength` characters, so `2024`, `january`, `march`, and `sept` become anchors or relevance evidence, and prefix matching lets `2024` match `20240115`.
+- *Rule:* `isCalendarTerm(token)` is true for `/^(19|20)\d{2}$/` and for `CALENDAR_TERMS`: `january … december`, plus `jan, feb, mar, apr, may, jun, jul, aug, sep, sept, oct, nov, dec`. Abbreviations shorter than `relevanceMinTermLength` are listed anyway, so the rule does not depend on that constant. `relevanceTokens` drops these tokens, which covers anchors and candidates in one place. `GENERIC_TERMS` is unchanged and kept separate.
+- *False-positive protection:* tokens are alphanumeric runs, so `http2`, `es2022`, `v2024`, `1080p`, `ipv6`, and `base64` survive. Numbers outside 1900–2099 (`8080`, `3000`) survive. Known limit: `2048` or `2049` written standalone is treated as a year.
+- *Fallback:* if every token is a calendar term, the text has no relevance evidence, the same as generic-only text today.
+
+**B6a. Emoji shortcodes (Req 3.14, Glossary Emoji_Shortcode).**
+- *Current failure:* no emoji handling exists. `:muscle:` reaches titles, bodies, and previews verbatim.
+- *Rule (strip, no mapping):* `stripEmojiShortcodes(text)` removes every match of `(?<![A-Za-z0-9:]):(?:[a-z0-9_+-]*[a-z][a-z0-9_+-]*|\+1|-1):(?![A-Za-z0-9:])`, collapses the spaces left behind on each line, and keeps line breaks.
+  - **Code-block exception:** stripping is not applied centrally in `makeSlide` to literal fenced-code content, because that would modify commands and examples. `buildRunSlide` instead marks whether each step came from a fenced code block; code-block steps are passed to `makeSlide` as already-literal lines that `makeSlide` does not re-strip, while the Run title and prose-fallback steps are stripped. Concretely, `makeSlide` gains an optional `literalBody` flag (default false); when set, the body is escaped but not shortcode-stripped. All other slide types strip title, body (dropping lines left empty or only a `•` marker), and preview before escaping.
+  - It is also applied in `headingKey` (B4), in `releaseTitle` before the tag fallback (so a name that is only `:rocket:` falls back to the tag), and inside B6b's comparison key.
+- *Why strip:* no emoji facility exists, mapping would need a table or dependency, and Unicode emoji may not render on the canvas.
+- *False-positive protection:* the lookarounds keep `10:30:45`, `2001:db8::1`, `a:b:c`, and `std::vector` unchanged, and uppercase `:Note:` is not a shortcode.
+- *Fallback:* a title emptied by stripping keeps its fixed prefix (for example `Feature:`). No text is ever substituted.
+
+**B6b. Overview duplicates (Req 5.12).**
+- *Current failure:* `buildIntroSlide` drops the README paragraph only when `normalize(paragraph) === normalize(description)`, comparing the already-truncated paragraph. A paragraph that repeats the description as its first sentence, prefixes it with the repository name, or differs only by a shortcode is shown twice.
+- *Rule:* `overviewKey(text, repo)` takes `stripEmojiShortcodes(toPlainText(text))`, removes an exact leading repository name (case-insensitive, literal) only when it is immediately followed by structural punctuation `:`, `-`, `–`, `—`, or `,`, and then applies `normalize`. There is no `is` lead-in and no other wording transform, so `chalk is a styling library` keeps the word `is`, and `chalk makes …` keeps its first word. `dedupeParagraph` splits the untruncated paragraph with the existing sentence splitter and drops each sentence whose key equals the key of the whole description or of any description sentence. The remaining sentences are joined and then truncated to `introMaxWords`. An empty result omits the paragraph.
+- *Why no threshold:* exact equality of normalized sentences covers case, punctuation, Markdown, whitespace, shortcodes, and a `repo:`-style lead-in without a tuning constant. No edit distance, token-overlap threshold, embeddings, LLM similarity, or fuzzy matching is used. The bias is intentionally toward false negatives (keeping a sentence) rather than collapsing distinct statements.
+- *False-positive protection:* a sentence must equal a description sentence in full. A sentence that adds meaningful words is kept, so `chalk is a styling library` and a bare `A styling library` description are not collapsed (accepted limit).
+- *Fallback:* without a description or paragraph, the existing overview rules apply (Req 5.1, 5.2).
+
+**Accepted limitations (this cycle).**
+- B1: a calendar-style tag with no leading zeros that otherwise satisfies the tag shape (for example `2024.1.15`) is classified as a semantic version, and as a patch when its third component is above 0.
+- B5: a standalone numeric token in the configured year range (1900–2099), such as `2048` or `2049`, is treated as calendar noise even when it is a meaningful technical value. Numbers outside that range and mixed alphanumeric terms (`es2022`, `http2`, `1080p`) stay eligible. No generic numeric classification is introduced.
+- B6b: deduplication is deterministic normalized equality only. Two sentences that differ by meaningful words are both kept, so `chalk is a styling library` is not collapsed into a bare `A styling library` description. This false-negative bias is intentional.
 
 ---
 
@@ -720,6 +804,48 @@ For any analysis, the number of PR-commit requests equals the number of distinct
 - **No late events:** after cancellation or disconnect, no progress, error, or 100 event is written.
 
 **Validates: Requirements 4.17, 4.18, 4.19, 4.20, 4.21, 4.22**
+
+### Property 19: Patch Releases Are Classified by Their Semantic Version
+
+For any tag built as `prefix + sep + [v|V] + X.Y.Z + [-label[.n]] + [+build]` with `sep ∈ {-, _, /, @}` or no prefix, `isPatchRelease` is true exactly when `Z > 0`. Tags whose version doesn't end the tag, has four components or leading zeros, or carries an unrecognized suffix are never patch releases. Patch releases never appear on the timeline or as release deep dives.
+
+**Validates: Requirements 7.4, 7.6, 7.19**
+
+### Property 20: Release Context Carries No Maintenance Noise
+
+For release notes mixing prose, changelog bullets, URLs, Markdown links, commit hashes, attributions, and reference lists, the release Change_Context contains no URL, no Markdown link syntax, no standalone hash, no parenthesized reference list, no generated `by @user in` attribution, and no bullet joined to another bullet. Every word of the context comes from the notes (Property 8), and when prose exists the context is its first sentence.
+
+**Validates: Requirements 7.6, 7.20**
+
+### Property 21: Documentation Commits Never Become Highlights
+
+No commit whose subject starts with `docs`, `docs(scope)`, `docs!`, or `docs(scope)!` followed by `:`, in any letter case, is an Engineering_Highlight on either path, and such a commit never prevents another commit in its Change_Group from being selected. Non-docs subjects that merely mention docs keep their previous eligibility.
+
+**Validates: Requirements 7.9, 7.14, 7.21**
+
+### Property 22: Run Headings Are Recognized After Normalization
+
+For each Run_Instructions keyword and any combination of letter case, Markdown emphasis, leading emoji or shortcode, and trailing colon, a section with at least one non-blank line produces a Run slide titled with that heading, and the earliest matching section in document order wins. Words that only start with a keyword (`Installing`, `Instance`) do not match.
+
+**Validates: Requirements 5.7, 5.8, 5.9, 5.10**
+
+### Property 23: Calendar Terms Are Never Relevance Evidence
+
+Adding or removing Calendar_Terms in any capability, feature, heading, PR, release, or commit text never changes the Anchor_Term set or any relevance decision, while tokens with mixed letters and digits and non-year numbers are preserved.
+
+**Validates: Requirements 7.22**
+
+### Property 24: Shortcode Noise Is Removed From Prose but Literal Code Is Preserved
+
+For any analysis result whose text fields contain Emoji_Shortcodes, no generated prose, slide title, label, or non-code preview text contains a raw shortcode, while literal content copied from a fenced code block (Run steps taken from a code block) is byte-for-byte preserved, including shortcode-like text. Times, IPv6 addresses, and colon-separated identifiers in prose are unchanged. The property is tested on both sides: a shortcode in prose is removed, and a `:rocket:`-containing command inside a code block survives.
+
+**Validates: Requirements 3.14**
+
+### Property 25: The Overview Does Not Repeat the Description
+
+The overview's README paragraph never contains a sentence whose normalized form equals the normalized description or one of its sentences, and every README sentence that is not such a duplicate is kept (subject to the word cap).
+
+**Validates: Requirements 5.1, 5.12**
 
 ---
 

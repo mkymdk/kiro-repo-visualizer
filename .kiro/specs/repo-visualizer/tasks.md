@@ -745,3 +745,110 @@ PASS rests on the observed child `exit` event, not on `cancel()` returning or th
 
 Real ffmpeg (31.7, re-run on the final code): child PID alive and encoding (12%) before `DELETE`. `SIGTERM` sent 37 ms after the request; the child's own `exit` event fired at 78 ms (code 255), within the 3,000 ms deadline, so no `SIGKILL` was needed. Afterwards the PID was gone (`process.kill(pid, 0)` → `ESRCH`, no `/proc` entry, 0 ffmpeg processes for the job). `DELETE` 204 in 83 ms, file gone, status `cancelled`, 0 active records, download 409, repeated `DELETE` 204, no resources left after the server closed. |
 | 18 | Render Job Lifecycle Has One Outcome | PASS | Guarded-transition matrix test; job ID first, written before `run()` starts; quiet stream end on cancel; disconnect while pending or rendering → shared `cancel()`; disconnect after complete/failed → no change (race 4); `DELETE` + disconnect share one cancellation and neither settles before exit (race 1); repeated `DELETE` 204 (race 5); `DELETE` after complete keeps the MP4 and download still works (race 6); unknown → 404; termination failure → structured 500; UI: Cancel enabled only with a job ID, `DELETE` sent before the stream closes. Real run: first event `{jobId, percent: 0}`, no event after cancel, no 100, no error, stream ended |
+
+---
+
+# Implementation Plan: Extraction Quality (Candidate B, narrowed)
+
+## Overview
+
+Six deterministic extraction fixes from live-validation issues 3, 4 (noise only), 5 (docs only), 8, 9, and 11 (Req 3.14, 5.7, 5.12, 7.19–7.22; Properties 19–25). All changes are in `src/server/storyboard.ts` plus tests. No analyzer, pipeline, route, renderer, or config changes; GitHub request counts are unchanged.
+
+Out of scope: capability rewriting (6), heading-only how-it-works (7), performance category (12), release-vs-PR duplication (rest of 4), other maintenance commit types (rest of 5), Candidates C and D, LLM rewriting or similarity.
+
+Branch `fix/extraction-quality` from `main`. Commit plan:
+1. `docs:` specs.
+2. `fix:` release classification and release-note context (B1, B2).
+3. `fix:` highlight and relevance filtering (B3, B5).
+4. `fix:` run headings, emoji shortcodes, and overview duplicates (B4, B6a, B6b).
+
+No push without approval.
+
+## Tasks
+
+- [ ] 32. Patch-release classification (B1, Req 7.19)
+  - [ ] 32.1 Add `parseSemanticVersionTag(tag)` (boundary strip → anchored SemVer core/prerelease/build, no prerelease-label allowlist, no dependency); reimplement `isPatchRelease` on `parsed.patch > 0`.
+  - [ ] 32.2 Tests: the positive and negative tag table below; arbitrary prerelease identifiers (`1.2.3-api`, `1.2.3-rc.1`) and build metadata (`1.2.3+build.5`); SemVer validity vs. patch classification kept distinct (`v1.2.0`/`v2.0.0` valid but not patches); a timeline/deep-dive test showing a prefixed patch release is excluded and a prefixed minor release is kept.
+
+- [ ] 33. Release-note cleanup (B2, Req 7.20)
+  - [ ] 33.1 Add `cleanReleaseNotes(body)` (steps 1–8 in design B2) and use it only in the release loop of `buildEvolutionSlides`. PR and commit contexts stay unchanged.
+  - [ ] 33.2 Tests: GitHub-generated notes; prose plus bullets; bullets only; links; bare URLs and autolinks; hashes (7 and 40 chars, backticked, parenthesized); reference lists; inline prose references kept; `sha256`/`0x…`/`deadbeef` kept; everything-noise notes → no release deep dive.
+
+- [ ] 34. Documentation-only commits (B3, Req 7.21)
+  - [ ] 34.1 Add `isDocsCommit(subject)`; reject before `take()` on both `selectHighlightCommits` paths.
+  - [ ] 34.2 Tests: `docs:`, `docs(scope):`, `docs!:`, `docs(scope)!:`, `Docs:`, `DOCS(api)!:` excluded; `feat: generate docs site`, `Add docs command`, `docsite: …`, `doc: …`, `fix(docs): …` keep their previous eligibility; a docs commit and a feature commit in one Change_Group → the feature commit is selected; a `docs:` PR's eligibility is unchanged (Req 7.1).
+
+- [ ] 35. Calendar terms (B5, Req 7.22)
+  - [ ] 35.1 Add `CALENDAR_TERMS` and `isCalendarTerm`; filter in `relevanceTokens`. Update its docstring.
+  - [ ] 35.2 Tests: years 1900/2024/2099 dropped; 1899/2100/8080/3000 kept; all months and abbreviations dropped; `http2`, `es2022`, `v2024`, `1080p`, `ipv6`, `base64` kept; a PR relevant only through `2024` or `March` is no longer relevant; `2024` no longer prefix-matches `20240115`.
+
+- [ ] 36. Run headings (B4, Req 5.7)
+  - [ ] 36.1 Extend `RUN_HEADING_RE`; make `headingKey` strip leading shortcodes (after task 37.1).
+  - [ ] 36.2 Tests: all eight keywords in lower, upper, and title case; `**Install**`, `## 📦 Installation`, `## :package: Install:`, `Example usage`; `Installing`, `Instance`, `Exampleapp` not matched; document order between `Example` and `Installation`; code-block preference and caps unchanged.
+
+- [ ] 37. Emoji shortcodes (B6a, Req 3.14)
+  - [ ] 37.1 Add `stripEmojiShortcodes`; apply it in `makeSlide` (title, body lines, preview), `headingKey`, and `releaseTitle`. Add an optional `literalBody` flag to `makeSlide` that escapes but does not shortcode-strip the body; `buildRunSlide` sets it for code-block-sourced steps so commands/examples are preserved. Prose-fallback Run steps and the Run title are still stripped.
+  - [ ] 37.2 Tests: `:muscle:`, `:+1:`, `:-1:`, `:white_check_mark:`, and unknown `:not_a_real_emoji:` removed; `10:30:45`, `2001:db8::1`, `a:b:c`, `std::vector`, `:Note:` kept; a shortcode-only release name falls back to the tag; a generated storyboard over a fixture seeded with shortcodes in every text field has no shortcode outside code-block Run steps.
+
+- [ ] 38. Overview duplicates (B6b, Req 5.12)
+  - [ ] 38.1 Add `overviewKey` and `dedupeParagraph`; compare before truncation in `buildIntroSlide`.
+  - [ ] 38.2 Tests: collapse cases (case, punctuation, `**bold**`, extra whitespace, shortcode, `chalk: …`, `chalk — …`, description repeated as first sentence with extra sentences kept); keep cases (description plus extra words in one sentence; a different sentence sharing most terms; a negated sentence; a different repository name as the lead-in; `chalk is a styling library` vs. description `A styling library` NOT collapsed — the accepted limit).
+
+- [ ] 39. Validation
+  - [ ] 39.1 Update existing tests only where the new rules intentionally change output (Property 8's corpus check normalizes shortcodes the same way).
+  - [ ] 39.2 Type-check (0 errors), full suite, build, governed-literal scan, `git diff --check`, traceability (Req 3: 1–14, Req 5: 1–12, Req 7: 1–22, Properties 1–25).
+  - [ ] 39.3 Regression: Properties 1–18 pass; duration and slide-count limits, repository-first ordering, and Change_Group tests unchanged; analyzer request-count tests unchanged (no analyzer diff).
+  - [ ] 39.4 Mutation checks (below); each must fail a behavioral test, not compilation.
+  - [ ] 39.5 Fixture comparison: storyboards for the three existing fixtures before and after, with every difference explained. No GitHub requests.
+  - [ ] 39.6 Fill the verification table, clean temporary files, commit as planned.
+
+## Test Matrix
+
+| Item | Must apply | Must not apply |
+|---|---|---|
+| B1 (excluded as patch) | `v1.2.3`, `1.2.3`, `V1.2.3`, `release-v1.2.3`, `yargs-parser-v20.2.9`, `pkg@1.2.3`, `@scope/pkg@1.2.3`, `cli/v1.2.3`, `my_tool_1.2.3`, `v1.2.3-rc.1`, `1.2.3-api`, `v1.2.3+build.5` | `v1.2.0`, `v2.0.0`, `v2.0.0-beta.1`, `v1.2.0-rc.1` (valid SemVer, not patches); `1.2.3.4`, `2024.01.15`, `node-1.2.3-compat`, `support-1.2.3x`, `nightly`, `latest` (not SemVer); release name `Support for 1.2.3` on tag `v2.0.0` |
+| B2 | URLs, `[text](url)`, `<url>`, `by @u in url`, hashes (7–40 hex), `(#12)`, `(#12, #13)`, `(o/r#12)`, Full Changelog, New Contributors | prose sentence, version `v2.1`, inline `#123` in prose, `@alice` in prose, `sha256`, `0x1f2e3d4c`, `deadbeef` |
+| B3 | `docs:`, `docs(scope):`, `docs!:`, `docs(scope)!:`, `Docs:`, `DOCS(api)!:` | `feat: generate docs site`, `Add docs command`, `docsite:`, `doc:`, `fix(docs):` |
+| B4 | Install, Installation, Getting Started, Setup, Usage, Quick Start, Example, Examples (any case, emphasis, emoji/shortcode lead, trailing colon) | Installing, Instance, Exampleapp |
+| B5 | 1900–2099 standalone, month names, abbreviations | 1899, 2100, 8080, `http2`, `es2022`, `v2024`, `1080p`, `ipv6`, `base64` |
+| B6a | `:muscle:`, `:+1:`, `:-1:`, `:white_check_mark:`, unknown shortcode | `10:30:45`, `2001:db8::1`, `a:b:c`, `std::vector`, `:Note:`, code-block Run steps |
+| B6b | case, punctuation, Markdown, whitespace, shortcode, `<repo> —/:/,/is` lead-in, duplicate first sentence | superset sentence, shared-terms sentence, negated sentence, other-name lead-in |
+
+## Mutation Plan
+
+Each mutation must make a behavioral test fail; a type or syntax error doesn't count.
+
+| Item | Mutation | Expected failing test |
+|---|---|---|
+| B1 | Restore the old start-anchored regex | prefixed-tag cases; `1.2.3.4` / `2024.01.15` kept |
+| B1 | Drop the `$` anchor after the SemVer suffix (allow trailing text) | `node-1.2.3-compat`, `support-1.2.3x` kept |
+| B1 | Allow a leading-zero version component | `2024.01.15` kept (not a version) |
+| B2 | Skip URL removal | Property 20 URL check |
+| B2 | Skip the prose-only preference (join bullets) | bullet-joining check |
+| B2 | Remove every `#\d+` (over-broad) | inline prose reference kept |
+| B3 | Remove the docs check | docs forms excluded |
+| B3 | Check docs after `take()` | same-group feature commit selected |
+| B3 | Case-sensitive match | `Docs:` / `DOCS(api)!:` excluded |
+| B4 | Drop `install`/`examples?` from the regex | new keywords recognized |
+| B4 | Compare raw heading text instead of `headingKey` | emphasis/shortcode headings |
+| B5 | Remove the calendar filter | year/month relevance cases |
+| B5 | Drop every all-digit token (over-broad) | `8080` / `3000` kept |
+| B6a | Skip stripping in `makeSlide` prose | Property 24 prose-removal check |
+| B6a | Strip inside `literalBody` code steps too | Property 24 code-preservation check |
+| B6a | Drop the lookarounds | `10:30:45` / `2001:db8::1` kept |
+| B6b | Restore whole-paragraph equality | duplicate-first-sentence case |
+| B6b | Use substring containment instead of sentence equality | superset/shared-terms keep cases |
+| B6b | Strip a leading `repo is` wording prefix | `chalk is …` kept whole |
+
+## Notes
+
+- No governed constants are added or changed. `CALENDAR_TERMS`, the release section names, and the shortcode pattern are algorithm data in `storyboard.ts`, like `GENERIC_TERMS`. There is no prerelease-label list.
+- Caps are unaffected: cleanup only removes text, so word and slide caps remain ceilings.
+- Fixtures are synthetic; this cycle makes no GitHub requests.
+
+**Accepted limitations (carried from design, confirmed with the user):**
+- B1: a leading-zero-free calendar version such as `2024.1.15` is classified as a semantic version (and a patch when the third component > 0).
+- B5: a standalone year-range number (1900–2099) like `2048` is treated as calendar noise; other numeric and mixed alphanumeric technical terms stay eligible.
+- B6b: deterministic normalized equality only, so `chalk is a styling library` and a bare `A styling library` description are both kept.
+
+**Scope guard:** if implementation shows any change is needed outside `storyboard.ts`, or would need an analyzer change, a new GitHub request, a governed constant, or a new dependency, stop and report instead of expanding scope.
