@@ -30,6 +30,11 @@ import {
   categorizePullRequest,
   rankSignificantPullRequests,
   isPatchRelease,
+  parseSemanticVersionTag,
+  cleanReleaseNotes,
+  isDocsCommit,
+  isCalendarTerm,
+  stripEmojiShortcodes,
   selectHighlightCommits,
   buildEvolutionSlides,
   buildChangeGroups,
@@ -107,6 +112,226 @@ function anchorsFor(result: RepoAnalysisResult): Set<string> {
     how?.headings ?? [],
   );
 }
+
+// ---------------------------------------------------------------------------
+// Extraction quality (Candidate B: B1–B6b, Properties 19–25)
+// ---------------------------------------------------------------------------
+
+describe("B1: parseSemanticVersionTag / isPatchRelease (Property 19)", () => {
+  const patch = ["v1.2.3", "1.2.3", "V1.2.3", "release-v1.2.3", "yargs-parser-v20.2.9", "pkg@1.2.3", "@scope/pkg@1.2.3", "cli/v1.2.3", "my_tool_1.2.3", "v1.2.3-rc.1", "1.2.3-api", "v1.2.3+build.5"];
+  const notPatch = ["v1.2.0", "v2.0.0", "v2.0.0-beta.1", "v1.2.0-rc.1"];
+  const notVersion = ["1.2.3.4", "2024.01.15", "node-1.2.3-compat", "support-1.2.3x", "nightly", "latest", "01.2.3"];
+
+  it("parses valid tags and distinguishes patch from non-patch", () => {
+    for (const t of patch) {
+      expect(parseSemanticVersionTag(t), t).not.toBeNull();
+      expect(isPatchRelease(release(t, "2024-01-01")), t).toBe(true);
+    }
+    for (const t of notPatch) {
+      expect(parseSemanticVersionTag(t), t).not.toBeNull(); // valid SemVer
+      expect(isPatchRelease(release(t, "2024-01-01")), t).toBe(false); // but not a patch
+    }
+  });
+
+  it("rejects non-SemVer tags and trailing text, keeping them eligible", () => {
+    for (const t of notVersion) {
+      expect(parseSemanticVersionTag(t), t).toBeNull();
+      expect(isPatchRelease(release(t, "2024-01-01")), t).toBe(false);
+    }
+  });
+
+  it("arbitrary prerelease identifiers are valid; build metadata does not affect patch", () => {
+    expect(parseSemanticVersionTag("1.2.3-api")?.prerelease).toBe("api");
+    expect(parseSemanticVersionTag("1.2.3+exotic.9")?.build).toBe("exotic.9");
+    expect(isPatchRelease(release("2.0.0+build.1", "2024-01-01"))).toBe(false);
+  });
+
+  it("excludes prefixed patch releases but keeps prefixed minor releases in the timeline", () => {
+    const result = makeResult({
+      readmeText: "# T\n\n## Features\n- **Parser** — fast token parser",
+      releases: [release("yargs-parser-v20.2.9", "2024-02-01", "parser bug fix"), release("yargs-parser-v20.3.0", "2024-03-01", "new parser option")],
+    });
+    const anchors = anchorsFor(result);
+    const titles = buildEvolutionSlides(result, anchors).map((s) => decode(s.title));
+    expect(titles.some((t) => t.includes("20.3.0"))).toBe(true);
+    expect(titles.some((t) => t.includes("20.2.9"))).toBe(false);
+  });
+});
+
+describe("B2: cleanReleaseNotes (Property 20)", () => {
+  it("removes URLs, links, hashes, references, and attributions while keeping prose", () => {
+    const body = [
+      "This release improves parser throughput substantially https://example.com/notes directly.",
+      "* Add fast path by @alice in https://github.com/o/r/pull/12",
+      "* Fix overflow (#34) in `a1b2c3d` see https://example.com/x",
+      "## New Contributors",
+      "* @newbie made their first contribution in https://github.com/o/r/pull/9",
+      "**Full Changelog**: https://github.com/o/r/compare/v1...v2",
+    ].join("\n");
+    const context = cleanReleaseNotes(body);
+    expect(context).toContain("improves parser throughput");
+    expect(context).not.toMatch(/https?:\/\//);
+    expect(context).not.toContain("](");
+    expect(context).not.toContain("by @");
+    expect(context).not.toContain("(#34)");
+    expect(context).not.toContain("a1b2c3d");
+    expect(context).not.toContain("newbie");
+    expect(context).not.toMatch(/Full Changelog/i);
+  });
+
+  it("keeps the first cleaned bullet when there is no prose", () => {
+    const body = "* Improve streaming decoder latency by @bob in https://github.com/o/r/pull/5\n* Second item";
+    expect(cleanReleaseNotes(body)).toBe("Improve streaming decoder latency");
+  });
+
+  it("preserves inline references, versions, and hex-like identifiers in prose", () => {
+    const body = "Fixes a crash introduced in #123 for v2.1 using sha256 digests and deadbeef cache keys.";
+    const context = cleanReleaseNotes(body);
+    expect(context).toContain("#123");
+    expect(context).toContain("v2.1");
+    expect(context).toContain("sha256");
+    expect(context).toContain("deadbeef"); // all-letters, not a hash
+  });
+
+  it("yields no context when everything is noise, so no release deep dive is built", () => {
+    expect(cleanReleaseNotes("* by @a in https://x/y/pull/1\n* `deadbee1`")).toBe("");
+  });
+});
+
+describe("B3: isDocsCommit (Property 21)", () => {
+  it("matches the conventional docs type in any case", () => {
+    for (const s of ["docs: x", "docs(readme): x", "docs!: x", "docs(api)!: x", "Docs: x", "DOCS(api)!: x"]) {
+      expect(isDocsCommit(s), s).toBe(true);
+    }
+  });
+  it("does not match non-docs subjects", () => {
+    for (const s of ["feat: generate docs site", "Add docs command", "docsite: x", "doc: x", "fix(docs): broken link"]) {
+      expect(isDocsCommit(s), s).toBe(false);
+    }
+  });
+  it("docs commits never take a highlight slot, even sharing a group with a feature commit", () => {
+    const commits = [
+      commit("docs: add parser guide", "2024-05-02", "", "d1"), // 'add' keyword, but docs type
+      commit("feat: streaming parser", "2024-05-01", "faster parsing", "f1"),
+    ];
+    const result = makeResult({ readmeText: "# T\n\n## Features\n- **Parser** — streaming parser", commits });
+    const anchors = anchorsFor(result);
+    const picks = selectHighlightCommits(commits, anchors, buildChangeGroups(commits, []), new Set());
+    expect(picks.map((p) => p.commit.sha)).toEqual(["f1"]);
+  });
+
+  it("a docs commit does not consume its Change_Group's single highlight slot", () => {
+    // d1 and f1 share one group via a forced grouping; docs must be rejected
+    // before the group is claimed, so f1 is still selected.
+    const commits = [
+      commit("docs: add parser notes", "2024-05-02", "", "d1"),
+      commit("feat: streaming parser", "2024-05-01", "faster parsing", "f1"),
+    ];
+    const anchors = new Set(["parser"]);
+    const groups = buildChangeGroups(commits, []);
+    groups.groupOf.set("d1", "g"); // same group id for both
+    groups.groupOf.set("f1", "g");
+    const picks = selectHighlightCommits(commits, anchors, groups, new Set());
+    expect(picks.map((p) => p.commit.sha)).toEqual(["f1"]);
+  });
+});
+
+describe("B5: isCalendarTerm / relevanceTokens (Property 23)", () => {
+  it("drops years 1900–2099 and month names, keeps technical terms", () => {
+    for (const t of ["1900", "2024", "2099", "january", "march", "sept", "dec"]) expect(isCalendarTerm(t), t).toBe(true);
+    for (const t of ["1899", "2100", "8080", "3000", "http2", "es2022", "v2024", "1080p", "ipv6", "base64"]) expect(isCalendarTerm(t), t).toBe(false);
+  });
+  it("calendar terms do not become relevance tokens; mixed terms survive", () => {
+    expect(relevanceTokens("Released March 2024 for es2022 and http2")).toEqual(expect.arrayContaining(["released", "es2022", "http2"]));
+    expect(relevanceTokens("Released March 2024")).not.toContain("2024");
+    expect(relevanceTokens("Released March 2024")).not.toContain("march");
+  });
+  it("a change relevant only through a year or month is no longer relevant", () => {
+    const anchors = new Set(["2024", "march"].flatMap((x) => [...relevanceTokens(x)])); // empty — nothing anchorable
+    expect(anchors.size).toBe(0);
+  });
+});
+
+describe("B6a: stripEmojiShortcodes (Property 24)", () => {
+  it("removes known and unknown shortcodes", () => {
+    expect(stripEmojiShortcodes("Great work :muscle:")).toBe("Great work");
+    expect(stripEmojiShortcodes(":+1: :-1: :white_check_mark: done")).toBe("done");
+    expect(stripEmojiShortcodes("ship it :not_a_real_emoji: now")).toBe("ship it now");
+  });
+  it("leaves times, IPv6, and colon identifiers unchanged", () => {
+    for (const s of ["10:30:45", "2001:db8::1", "a:b:c", "std::vector", ":Note:"]) {
+      expect(stripEmojiShortcodes(s), s).toBe(s);
+    }
+  });
+  it("no shortcode reaches storyboard prose, but code-block run steps are preserved", () => {
+    const readme = "# T\n\n## Installation\n\n```\nnpm run deploy # :rocket: ship\n```\n\n## Features\n- **Core** — core :muscle: engine";
+    const result = makeResult({ readmeText: readme, metadata: { description: "Core :sparkles: engine", topics: [], stars: null, language: null, license: null } });
+    const slides = generateStoryboard(result);
+    for (const s of slides) {
+      const text = s.type === "run" ? "" : `${decode(s.title)} ${decode(s.body)} ${decode(s.previewSummary)}`;
+      expect(text).not.toMatch(/:[a-z0-9_+-]*[a-z][a-z0-9_+-]*:/);
+    }
+    const run = slides.find((s) => s.type === "run")!;
+    expect(decode(run.body)).toContain(":rocket:"); // literal code preserved
+  });
+});
+
+describe("B6b: overview deduplication (Property 25)", () => {
+  const withDesc = (description: string, readmeText: string): RepoAnalysisResult =>
+    makeResult({ repo: "chalk", readmeText, metadata: { description, topics: [], stars: null, language: null, license: null } });
+
+  it("collapses normalized duplicates", () => {
+    const cases = [
+      ["A styling library", "# chalk\n\nA styling library"],
+      ["A styling library", "# chalk\n\n**A styling library.**"],
+      ["A styling library", "# chalk\n\nchalk: A styling library"],
+      ["A styling library", "# chalk\n\nchalk — A styling library"],
+      ["A styling library", "# chalk\n\nA styling library. It is fast."],
+    ] as const;
+    for (const [desc, readme] of cases) {
+      const body = decode(buildIntroSlide("chalk", readme, withDesc(desc, readme).metadata).body);
+      const dupCount = (body.match(/A styling library/gi) ?? []).length;
+      expect(dupCount, readme).toBeLessThanOrEqual(1);
+    }
+    // The trailing distinct sentence is kept.
+    expect(decode(buildIntroSlide("chalk", "# chalk\n\nA styling library. It is fast.", withDesc("A styling library", "x").metadata).body)).toContain("It is fast.");
+  });
+
+  it("keeps meaningfully different sentences", () => {
+    const keep = [
+      ["A styling library", "# chalk\n\nA styling library for the terminal with 256-color support."],
+      ["A styling library", "# chalk\n\nColors make terminal output readable."],
+      ["A styling library", "# chalk\n\nThis is not a styling library at all."],
+      ["A styling library", "# chalk\n\nchalk is a styling library"], // 'is' lead-in NOT stripped (accepted limit)
+    ] as const;
+    for (const [desc, readme] of keep) {
+      const body = decode(buildIntroSlide("chalk", readme, withDesc(desc, readme).metadata).body);
+      const readmeSentence = readme.split("\n\n")[1]!;
+      expect(body, readme).toContain(readmeSentence);
+    }
+  });
+});
+
+describe("B4: run heading recognition (Property 22)", () => {
+  const headings = ["Install", "Installation", "Getting Started", "Setup", "Usage", "Quick Start", "Example", "Examples"];
+  it("recognizes each keyword with case, emphasis, emoji, and trailing colon", () => {
+    for (const h of headings) {
+      for (const variant of [`## ${h}`, `## ${h.toUpperCase()}`, `## **${h}**`, `## 📦 ${h}:`, `## :package: ${h}`]) {
+        const slide = buildRunSlide(`${variant}\n\nnpm install\n`);
+        expect(slide, variant).not.toBeNull();
+      }
+    }
+  });
+  it("does not match words that merely start with a keyword", () => {
+    for (const h of ["Installing", "Instance", "Exampleapp"]) {
+      expect(buildRunSlide(`## ${h}\n\nsome text\n`), h).toBeNull();
+    }
+  });
+  it("keeps document order: an earlier Example wins over a later Installation", () => {
+    const slide = buildRunSlide("## Example\n\nrun the demo\n\n## Installation\n\nnpm install\n");
+    expect(decode(slide!.title)).toBe("How to run: Example");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Text and Markdown helpers
