@@ -1,7 +1,7 @@
 import React, { useRef, useState } from "react";
 import { VIDEO_CONFIG } from "../config/output";
 import { Slide } from "../types/index";
-import { useRenderJob } from "../hooks/useRenderJob";
+import { canCancel, useRenderJob } from "../hooks/useRenderJob";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -136,7 +136,8 @@ export function VideoExport({ slides, onBack }: VideoExportProps): React.ReactEl
         <button
           type="button"
           onClick={cancel}
-          disabled={isCancelled}
+          disabled={!canCancel(status, jobId)}
+          title={jobId ? undefined : "Cancel becomes available once the render job has started."}
         >
           Cancel
         </button>

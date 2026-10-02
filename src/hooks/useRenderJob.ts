@@ -19,6 +19,67 @@ export interface RenderJobState {
 }
 
 // ---------------------------------------------------------------------------
+// Pure helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+/** Minimal fetch signature used for the cancellation request. */
+export type FetchLike = (input: string, init?: { method?: string }) => Promise<unknown>;
+
+/**
+ * Cancel a render job: send `DELETE /api/render/:jobId` first, then close the
+ * progress stream. Closing the stream also cancels on the server (Req 4.21);
+ * both paths are idempotent, so their order only makes the explicit request
+ * arrive first.
+ *
+ * @param jobId - The job ID from the first progress event, or null if not known yet.
+ * @param controller - Aborts the progress-stream request.
+ * @param fetchImpl - The fetch implementation.
+ *
+ * @remarks
+ * Makes one HTTP request to the local API when a job ID is known.
+ */
+export async function cancelRenderJob(
+  jobId: string | null,
+  controller: AbortController | null,
+  fetchImpl: FetchLike,
+): Promise<void> {
+  if (jobId) {
+    try {
+      await fetchImpl(`/api/render/${jobId}`, { method: "DELETE" });
+    } catch {
+      // Best-effort: closing the stream below also cancels on the server.
+    }
+  }
+  controller?.abort();
+}
+
+/**
+ * Whether the Cancel control can be used: rendering and the job ID is known.
+ *
+ * @param status - Current hook status.
+ * @param jobId - Job ID from the first progress event, or null.
+ * @returns True when Cancel can send `DELETE`.
+ */
+export function canCancel(status: RenderJobStatus | "idle", jobId: string | null): boolean {
+  return status === "rendering" && jobId !== null;
+}
+
+/**
+ * Outcome of a progress stream that ended without a client-side cancel.
+ * A stream that ends with neither a 100 event nor an error event was
+ * cancelled on the server (Req 4.18) and is not a failure.
+ *
+ * @param sawComplete - Whether the terminal 100 event arrived.
+ * @param sawError - Whether an error event arrived.
+ * @returns The resulting status.
+ */
+export function streamOutcome(sawComplete: boolean, sawError: boolean): "complete" | "failed" | "cancelled" {
+  if (sawComplete) return "complete";
+  if (sawError) return "failed";
+  return "cancelled";
+}
+
+// ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
 
@@ -82,6 +143,8 @@ export function useRenderJob(
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        let sawComplete = false;
+        let sawError = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -97,7 +160,12 @@ export function useRenderJob(
               const payload = JSON.parse(line.slice(6)) as {
                 percent?: number;
                 jobId?: string;
+                error?: string;
               };
+              if (typeof payload.error === "string") {
+                sawError = true;
+                setError(payload.error);
+              }
               if (typeof payload.percent === "number") {
                 setPercent(payload.percent);
               }
@@ -106,6 +174,7 @@ export function useRenderJob(
                 jobIdRef.current = payload.jobId;
               }
               if (payload.percent === 100) {
+                sawComplete = true;
                 setStatus("complete");
               }
             } catch {
@@ -113,6 +182,7 @@ export function useRenderJob(
             }
           }
         }
+        if (!cancelled) setStatus(streamOutcome(sawComplete, sawError));
       } catch (err: unknown) {
         if (cancelled) return;
         const msg =
@@ -130,17 +200,8 @@ export function useRenderJob(
   }, [slides, targetDurationSeconds]);
 
   const cancel = useCallback(async (): Promise<void> => {
-    const id = jobIdRef.current;
-    abortControllerRef.current?.abort();
     setStatus("cancelled");
-
-    if (id) {
-      try {
-        await fetch(`/api/render/${id}`, { method: "DELETE" });
-      } catch {
-        // Best-effort cancel
-      }
-    }
+    await cancelRenderJob(jobIdRef.current, abortControllerRef.current, (input, init) => fetch(input, init));
   }, []);
 
   return { percent, jobId, status, error, cancel };
