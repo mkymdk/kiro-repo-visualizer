@@ -632,7 +632,7 @@ Each render job writes its output to a unique temp file path derived from a UUID
 
 For a job cancelled while pending or rendering:
 - the active ffmpeg process receives `SIGTERM`, and receives `SIGKILL` only if it hasn't exited by `KILL_GRACE_MS`;
-- the process's **exit is observed** (a signal being sent is not evidence) within `VIDEO_CONFIG.cancelTimeoutSeconds`. A pending job whose encoder never started satisfies this vacuously. A run where exit isn't confirmed by the deadline fails this property, even though the job stays `cancelled`;
+- the process's **exit is observed** (a signal being sent is not evidence) within `VIDEO_CONFIG.cancelTimeoutSeconds`. A pending job whose encoder never started satisfies this vacuously. A run where exit isn't confirmed by the deadline fails this property, even though the job stays `cancelled`. `cancel()` returning, the status being `cancelled`, or the partial file being deleted is never on its own evidence that this property holds; the termination failure is logged;
 - frame preparation stops at the next slide boundary;
 - the partial output file no longer exists;
 - the final status is `cancelled`;
