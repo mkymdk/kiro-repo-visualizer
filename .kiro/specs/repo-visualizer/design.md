@@ -206,7 +206,7 @@ Bug-fix PRs can appear as one-line timeline entries when relevant, but never con
 
 1. Index the window: `sha → parents` for the 50 fetched commits.
 2. `walk(start)` follows parent links through commits **in the window only** and returns `{ reached, complete }`. `complete` is false as soon as the walk meets a parent SHA that is not in the window. Commits with no parents (repository roots) end a walk without making it incomplete.
-3. For every Merge_Commit `M` (≥ 2 parents), newest first in window order:
+3. For every Merge_Commit `M` (≥ 2 parents), compute its candidate members as follows. Then assign them, processing merge commits **descendants first**: in decreasing order of the number of window commits reachable from `M` (a descendant always reaches strictly more than any merge commit it contains), with ascending SHA as a deterministic tie-break. A merge commit that an earlier (outer) merge has already claimed is skipped as a group owner. This order comes from the commit graph alone; window listing order and commit dates are never used.
    - `first = walk(parents[0])`, `branch = walk(parents[1])`
    - If `first.complete`: group = `{M} ∪ (branch.reached \ first.reached)`, minus commits already assigned.
    - Otherwise: group = `{M}` only. Non-ancestry of the first parent can't be proven, because a commit reachable from the second parent might be reached from the first parent through commits outside the window.
