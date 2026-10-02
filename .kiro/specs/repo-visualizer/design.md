@@ -351,11 +351,52 @@ Converts a `Slide[]` into an MP4 file. Runs on the server.
 - Frame preparation yields to the event loop (`await setImmediate`) after each slide, so the timer can fire while frames are drawn. Today the drawing loop blocks the event loop.
 - `start()` wraps the whole job in `try/finally { tracker.stop() }`, so the timer is cleared on success, failure and cancellation. The renderer no longer calls `onProgress(100)`. The route sends the single terminal event, `{"percent":100,"jobId":…}`.
 - The route adds a `closed` flag, set on completion, on error, and on `res.on("close")` (client disconnect). The `onProgress` sink checks it before every write.
-- `VideoRenderer` keeps each active job's tracker. `abort(jobId)` stops that tracker before deleting the output file, so the existing cancellation path also releases the timer. Whether ffmpeg itself is stopped is not changed in this cycle (follow-up F1 in tasks.md).
+- `VideoRenderer` keeps each active job's tracker in its active-render record. Cancellation (below) stops it as its first step.
 
 The route's error branch is the one rewritten by the unmerged `fix/render-sse-double-error-handling` (`b07c4b4`). This work builds on that change. It does not rewrite the same lines independently.
 
-**Cancellation:** The renderer exposes an `abort()` method. When called, it signals ffmpeg to terminate and deletes the partial output file within `VIDEO_CONFIG.cancelTimeoutSeconds` (3 s).
+**Job lifecycle and cancellation (Req 4.7, 4.8, 4.18–4.22):**
+
+State machine. A guarded transition is the only way to change `job.status`:
+
+```
+pending ──start──▶ rendering ──▶ complete
+   │                   ├──────▶ failed
+   └──────cancel───────┴──────▶ cancelled
+```
+
+- `transition(job, from: Set<Status>, to)` is a compare-and-set. It changes the status only when the current status is in `from`, and returns whether it did. Allowed transitions: `pending→rendering`, `pending→cancelled`, and `rendering→{complete, failed, cancelled}`.
+- Terminal states (`complete`, `failed`, `cancelled`) have no outgoing transitions. A late ffmpeg `end` after cancellation finds `cancelled` and its `rendering→complete` attempt fails, so it can't resurrect the job. The outcome never depends on callback ordering.
+- Cancellation is reserved first: `rendering→cancelled` happens at the start of cancellation, so completion can no longer win while the encoder is still being stopped.
+
+Renderer API:
+- `createJob(): RenderJob` creates and registers a `pending` job and returns it. No rendering work happens yet.
+- `run(jobId, slides, onProgress, targetDurationSeconds?): Promise<RenderJob>` performs `pending→rendering` and renders. It resolves with the job when the job ends `complete` or `cancelled`, and rejects with `ApiError("internal_error")` only when the job ends `failed`. If the job was cancelled while pending, it resolves immediately without doing any work.
+- `start(slides, onProgress, targetDurationSeconds?)` stays as a thin `createJob` + `run` wrapper for existing callers.
+- `cancel(jobId): Promise<void>` is the single cancellation implementation, used by `DELETE`, client disconnect, and any internal path. It is idempotent: concurrent callers share one in-flight cancellation promise, and terminal jobs return immediately with no change. `abort(jobId)` remains an alias.
+- Each running job has an active-render record `{ tracker, controller: AbortController, command | null, exited: Promise<void>, cancelling: Promise<void> | null }`. It is removed when the job settles.
+
+Cancellation sequence, started immediately (there is no wait before signalling):
+1. Compare-and-set `pending|rendering → cancelled`. If that fails, the job is already terminal or another caller won: return the in-flight promise, or resolve.
+2. Stop the progress tracker; no further progress is emitted.
+3. `controller.abort()`. The frame-preparation loop checks `signal.aborted` after each slide and stops, and frame writes stop.
+4. If an ffmpeg command is active, send `SIGTERM` (`command.kill("SIGTERM")`).
+5. Wait for **confirmed process exit**: the child process's own `exit` event (observed on `command.ffmpegProc`, captured at fluent-ffmpeg's `start` event), or, if no child was ever spawned, fluent-ffmpeg's `error`/`end`. Sending a signal is never treated as exit. If the command has been run but the child hasn't spawned yet, the signal is sent as soon as `start` fires.
+6. If it hasn't exited after `KILL_GRACE_MS`, send `SIGKILL`.
+7. Wait for confirmed exit again, up to the deadline `T`.
+8. Delete the partial output file (best-effort; a missing file is fine).
+9. Settle the cancellation: resolve if exit was confirmed (or no encoder ever ran), otherwise reject as below.
+The status stays `cancelled` throughout, and the active record is removed once cancellation settles.
+
+Timing. Let `T = VIDEO_CONFIG.cancelTimeoutSeconds × 1000`, measured from the cancellation request:
+- `KILL_GRACE_MS = T / 2` (1,500 ms), a renderer-module constant derived from the governed value.
+- `SIGKILL` is sent at the latest at `T/2`, so the forced kill and the file deletion both fit inside `T`.
+- Req 4.8 is satisfied only when exit is confirmed within `T` (or no encoder was running). A resolved promise, a `cancelled` status, or a deleted file is not enough on its own.
+- **Exceptional path:** if exit isn't confirmed by `T`, the job stays `cancelled` (no new state) and can never become complete or downloadable, and the partial file is still deleted. `cancel()` then **rejects** with `ApiError("internal_error")` describing a cancellation-termination failure, which is logged. `DELETE` maps it to a 500; the disconnect path logs it.
+- One observer stays attached to the surviving child so a late exit is still recorded and the listener is then removed. No ffmpeg process or listener is left unobserved after `cancel()` settles.
+- If `SIGTERM` exits ffmpeg first, `SIGKILL` is never sent.
+
+Failure path (Req 4.7, previously unmet): `rendering→failed`, then the partial output is deleted. Failure does **not** signal or wait for the encoder; it only runs after ffmpeg has already reported its error. If the unlink fails, the original render error stays the reported failure, the cleanup error is logged, and there is no second transition. Completion keeps its output. Only the low-level file-removal helper is shared with cancellation.
 
 **File size check:** After encoding completes, if file size exceeds `VIDEO_CONFIG.maxFileSizeBytes` (200 MB), the download response includes a `X-File-Size-Warning` header and the frontend prompts for confirmation before triggering the browser download.
 
@@ -368,12 +409,28 @@ The route's error branch is the one rewritten by the unmerged `fix/render-sse-do
 | `POST` | `/api/analyze` | `RepositoryAnalyzer` | Validate URL, fetch repo data |
 | `GET` | `/api/storyboard` | `StoryboardGenerator` | Generate slides from cached analysis |
 | `POST` | `/api/render` | `VideoRenderer` | Start render job, return SSE stream. Body: `{ slides: Slide[], targetDurationSeconds?: number }` |
-| `DELETE` | `/api/render/:jobId` | `VideoRenderer.abort` | Cancel in-progress render |
+| `DELETE` | `/api/render/:jobId` | `VideoRenderer.cancel` | Cancel a render. Idempotent: 204 for every existing job, 404 for an unknown job |
 | `GET` | `/api/download/:jobId` | file stream | Stream completed MP4 to browser |
 
 All routes apply a top-level error handler that maps `ApiError` codes to HTTP status codes and returns the standard `{ "error": "...", "message": "..." }` JSON shape.
 
 The `POST /api/render` handler validates the optional `targetDurationSeconds` **before** switching the response into SSE mode. When present, it must be a finite number within `VIDEO_CONFIG.minDurationSeconds`–`VIDEO_CONFIG.maxDurationSeconds`; otherwise the handler returns a standard `HTTP 400 { "error": "invalid_input", "message": "..." }` JSON response and does not open the SSE stream. When absent, the renderer derives the default duration from the slide count.
+
+**Render stream lifecycle (Req 4.17–4.21):**
+1. After validation, the handler calls `createJob()`, opens the SSE stream, and writes `{"jobId":…,"percent":0}` as the **first** event, before any frame work. Then it calls `run()`.
+2. Heartbeat events follow: monotonic, at most 99.
+3. Outcome:
+   - `run()` resolves `complete`: one terminal `{"percent":100,"jobId":…}` event, then the stream ends.
+   - Resolves `cancelled`: the stream ends with no 100 and no error event.
+   - Rejects (`failed`): one error event, then the stream ends.
+4. `res.on("close")` sets `closed`, so no write happens after a close. If the job is still `pending` or `rendering`, it also calls `cancel(jobId)`, the same path as `DELETE`. If the job is already terminal, nothing changes; this covers completion winning just before the close.
+
+**`DELETE /api/render/:jobId`:**
+- Unknown job: 404, unchanged.
+- Pending or rendering: `await cancel(jobId)`, then 204 once the cancellation contract is met.
+- Cancelled, failed, or complete: 204, no change. A complete job's MP4 is **not** deleted.
+
+**`GET`/`HEAD /api/download/:jobId`** stays as it is: only `complete` jobs are served. Pending, rendering, failed and cancelled jobs get 409 (Req 4.20).
 
 `partialFailures` can now also contain `metadata`, `pullRequests`, and `releases`; `AnalysisProgress` lists these names as it does today.
 
@@ -571,11 +628,21 @@ Each render job writes its output to a unique temp file path derived from a UUID
 
 **Validates: Requirements 4.7, 4.8**
 
-### Property 6: Cancellation Is Time-Bounded
+### Property 6: Cancellation Terminates Rendering Within the Timeout
 
-Calling `abort()` on an active render job guarantees that the ffmpeg process is terminated and the partial output file is deleted within `VIDEO_CONFIG.cancelTimeoutSeconds` (3 seconds) of the cancellation request.
+For a job cancelled while pending or rendering:
+- the active ffmpeg process receives `SIGTERM`, and receives `SIGKILL` only if it hasn't exited by `KILL_GRACE_MS`;
+- the process's **exit is observed** (a signal being sent is not evidence) within `VIDEO_CONFIG.cancelTimeoutSeconds`. A pending job whose encoder never started satisfies this vacuously. A run where exit isn't confirmed by the deadline fails this property, even though the job stays `cancelled`;
+- frame preparation stops at the next slide boundary;
+- the partial output file no longer exists;
+- the final status is `cancelled`;
+- `cancel()` resolves within `VIDEO_CONFIG.cancelTimeoutSeconds` after confirmed exit, or rejects with a cancellation-termination failure if exit isn't confirmed;
+- a later ffmpeg `end` or `error` never changes the status;
+- the job's download is rejected.
 
-**Validates: Requirements 4.8**
+A failed job's partial output is also deleted, without signalling the encoder. A cleanup error never replaces the original failure.
+
+**Validates: Requirements 4.7, 4.8, 4.20**
 
 ### Property 7: Target Duration Is Range-Bounded
 
@@ -643,6 +710,17 @@ For any analysis, the number of PR-commit requests equals the number of distinct
 
 **Validates: Requirements 2.11, 2.12**
 
+### Property 18: Render Job Lifecycle Has One Outcome
+
+- **Job ID first:** the first SSE event of every render carries the job ID, with percent 0, before any frame work.
+- **One outcome:** each job reaches exactly one terminal state and never leaves it, whatever the interleaving of completion, failure, `DELETE` and client disconnect.
+- **Disconnect while active:** a disconnect while pending or rendering goes through the same `cancel()` path as `DELETE`.
+- **Disconnect after terminal:** a disconnect after a terminal state changes nothing.
+- **Idempotent DELETE:** `DELETE` on a terminal job returns 204 with no change and keeps a complete job's file. Repeated or concurrent cancellations give the same result as one.
+- **No late events:** after cancellation or disconnect, no progress, error, or 100 event is written.
+
+**Validates: Requirements 4.17, 4.18, 4.19, 4.20, 4.21, 4.22**
+
 ---
 
 ## Error Handling
@@ -679,7 +757,7 @@ POST /api/analyze
                ▼  (validation passed → SSE stream opens)
                ├─ SSE percent updates → progress bar
                ├─ render failure      → error banner + retry button
-               └─ cancel              → DELETE /api/render/:id
+               └─ cancel / disconnect → cancel(jobId): 204, stream ends without 100 or error
 ```
 
 The `invalid_input` code (HTTP 400) is distinct from `insufficient_content` (HTTP 422): the former signals a malformed or out-of-range render parameter (Target_Duration), the latter signals that the repository cannot produce the minimum slide count. Both are validated before the SSE stream is opened so the error path never rides the SSE channel.
@@ -706,6 +784,13 @@ Plus a hostile fixture whose every text field contains HTML metacharacters.
 - **`tests/renderer.test.ts`** — `wrapText` with a fake `measure` (explicit breaks, blank lines, long-word breaking, exact-fit lines); `fitLines` ellipsis behaviour; title max lines; existing duration, abort, and sweep tests unchanged.
 - **`tests/routes.test.ts`** — target-duration validation; render SSE sink: exactly one terminal `percent: 100` event with `jobId`, no writes after completion, error, or client disconnect.
 - **`tests/progress.test.ts`** — `ProgressTracker` and `VideoRenderer.start` under `vi.useFakeTimers()`, with `fluent-ffmpeg` mocked as a scripted event emitter. Covers: the cadence bound for no reports, a single report, reports just before the boundary, bursts, and a long silent encode; events during frame preparation; monotonic values; ≤ 99 before completion; timers cleared on success, ffmpeg error, and frame-write error (`vi.getTimerCount() === 0`). No wall-clock sleeps.
+- **`tests/cancellation.test.ts`** — `VideoRenderer` lifecycle under fake timers with a scripted ffmpeg whose `kill(signal)` is recorded and whose exit is scripted.
+  - Cancellation: `SIGTERM` sent; `SIGKILL` only when `SIGTERM` doesn't exit, and before the deadline; frame loop stops mid-way; partial file deleted; resolves within the timeout; `cancelled` survives a late `end` or `error`.
+  - Races: concurrent `cancel()` calls share one cleanup; `DELETE` and disconnect nearly simultaneous; `end` during cancellation; `error` after `SIGTERM`/`SIGKILL`; completion just before close.
+  - Idempotency: terminal-job cancel is a no-op and keeps a complete job's file.
+  - Failure: the failed path deletes partial output.
+  - Cleanup: no timers left.
+  - Route and hook: job ID first, quiet stream end on cancel, disconnect → `cancel()`, repeated `DELETE` → 204, download of cancelled/failed → 409, UI Cancel sends `DELETE` while rendering.
 - **Change_Group tests (in `tests/storyboard.test.ts`)** — `buildChangeGroups` for merge-commit, squash, rebase-tip, nested-merge, missing-`mergeCommitSha`, PR-data-unavailable, and truncated-window histories; `prsNeedingEvidence` returns only truncated merge-commit Selected_PRs (never squash, rebase, or graph-proven merges); evidence excludes matching window commits, evidence SHAs outside the window and evidence for non-selected PRs are ignored, missing evidence equals graph-only output, and selection is independent of evidence (first-parent walk leaves the window → merge commit only; branch commit reachable only through an out-of-window commit → not grouped; root commit → walk still complete); Property 15 on a fixture that mirrors this repository's PR #9 history; message-rewrite invariance; timeline + deep dive for the same PR allowed; fallback path also limited to one highlight per group.
 
 ### Integration Tests

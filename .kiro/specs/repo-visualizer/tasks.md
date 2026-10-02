@@ -610,3 +610,122 @@ Branch and commit plan:
   - 10: duration rounding remainder.
   - 11: emoji shortcodes and near-duplicate overview text.
   - 12: no category for performance changes.
+
+---
+
+# Implementation Plan: Render Cancellation Lifecycle (Candidate A, resolves F1)
+
+## Overview
+
+A correctness fix for the existing cancellation requirements (Req 4.7, 4.8, 4.18–4.22; Properties 6, 18).
+
+Today `abort()` deletes the output file but never stops ffmpeg. The encode keeps running, a late `end` overwrites `cancelled` with `complete` and recreates a downloadable MP4, and the UI can't cancel, because it only learns the job ID from the final event. Failed renders also leave their partial output (Req 4.7).
+
+**Correction to earlier verification tables:** previous Property 6 "PASS" rows were verified only by file deletion and elapsed time. Process termination, frame-loop stop, and late-completion protection were never tested.
+
+Out of scope: Candidates B–D, and retrying or resuming cancelled renders.
+
+Commit plan, on a new branch `fix/render-cancellation-lifecycle` from `main`:
+1. `docs:` specs.
+2. `fix:` renderer and route lifecycle.
+3. `fix:` UI cancel.
+
+No push without approval.
+
+## Tasks
+
+- [ ] 28. Job state machine and renderer API (`renderer.ts`, `types/index.ts`)
+  - [ ] 28.1 Add the guarded `transition(job, from, to)` compare-and-set and route every status change through it. Allowed: `pending→rendering`, `pending→cancelled`, `rendering→{complete, failed, cancelled}`. Terminal states have no outgoing transitions.
+  - [ ] 28.2 Split the API into `createJob()` (pending, registered, no work) and `run(jobId, slides, onProgress, target?)`. `run` resolves on `complete`/`cancelled`, rejects only on `failed`, and returns immediately for a job cancelled while pending. Keep `start()` as a `createJob` + `run` wrapper.
+  - [ ] 28.3 Active-render record `{ tracker, controller, command, exited, cancelling }`. The frame loop checks `controller.signal.aborted` after each slide. Keep a handle to the ffmpeg command, and settle `exited` from ffmpeg's `end` or `error`.
+  - [ ] 28.4 Single `cancel(jobId)`, with `abort` as an alias:
+    1. Compare-and-set to `cancelled`, so completion can no longer win.
+    2. Stop the tracker.
+    3. `controller.abort()`.
+    4. `SIGTERM`.
+    5. Wait for exit.
+    6. `SIGKILL` at `KILL_GRACE_MS = cancelTimeoutSeconds × 1000 / 2` if ffmpeg hasn't exited.
+    7. Wait for **confirmed exit**: the child process's `exit` event, not the signal call, until the deadline.
+    8. Delete the partial file.
+    9. Resolve; if exit wasn't confirmed by the deadline, reject with a cancellation-termination failure (job stays `cancelled`, file still deleted, the late exit still observed). A pending job with no encoder resolves without signals.
+
+    Concurrent callers share the in-flight promise; terminal jobs return immediately.
+  - [ ] 28.5 Completion uses compare-and-set `rendering→complete`. If it fails, nothing is recorded and the job stays `cancelled`. Failure uses `rendering→failed` and deletes the partial output (Req 4.7) without signalling the encoder. An unlink error is logged; the original error stays the reported failure, with no second transition.
+
+- [ ] 29. Route lifecycle (`routes.ts`)
+  - [ ] 29.1 `POST /api/render`:
+    - `createJob()` after validation, open SSE, write `{"jobId","percent":0}` first, then `run()`.
+    - `complete`: one terminal 100. `cancelled`: end quietly, with no 100 and no error. `failed`: one error event.
+  - [ ] 29.2 `res.on("close")`: set `closed`. If the job is still pending or rendering, call `cancel(jobId)` (shared path). If it's terminal, change nothing.
+  - [ ] 29.3 `DELETE`: 404 for an unknown job (unchanged). Otherwise `await cancel(jobId)` then 204. A terminal job is a no-op 204 and never deletes a complete job's file.
+  - [ ] 29.4 Confirm download serves only `complete` and returns 409 for every other state.
+
+- [ ] 30. UI cancel (`useRenderJob.ts`, `VideoExport.tsx`)
+  - [ ] 30.1 Hook: take the job ID from the first event. `cancel()` sends `DELETE` first, then closes the stream. Don't treat a quiet stream end after cancellation as a failure.
+  - [ ] 30.2 Disable the Cancel button until a job ID is known; enable it while rendering.
+
+- [ ] 31. Tests and validation
+  - [ ] 31.1 New `tests/cancellation.test.ts` (fake timers; scripted ffmpeg with recorded `kill(signal)` and scripted exit):
+    - Signals vs. exit: the scripted ffmpeg records `kill(signal)` separately from a scripted process `exit`. `SIGTERM` sent; when the process exits after it, `SIGKILL` is never sent (race 7); when it doesn't, `SIGKILL` is sent at `KILL_GRACE_MS` and exit is observed before the deadline (race 8). When exit never comes, `cancel()` rejects at the deadline, the job stays `cancelled`, the file is deleted, and download returns 409.
+    - Frame loop stops mid-way; partial file deleted; `cancel()` resolves within `cancelTimeoutSeconds`.
+    - Final state `cancelled`, and it stays `cancelled` when `end` arrives during cancellation (race 2) or `error` arrives after `SIGTERM`/`SIGKILL` (race 3).
+    - Concurrent `cancel()` calls run cleanup once.
+    - Cancel while pending: `run` does no work.
+    - Repeated cancel after `cancelled` (race 5) and cancel after `complete` keeps the MP4 (race 6).
+    - Req 4.7 regression: partial output exists, rendering fails, the job becomes `failed`, the output is deleted, download is rejected, no signal is sent. An unlink error keeps the original failure.
+    - No timers or listeners left.
+  - [ ] 31.2 Route tests (`tests/routes.test.ts`, integration):
+    - The job ID event comes first.
+    - Cancel ends the stream with no 100 and no error event.
+    - Disconnect while rendering calls the shared `cancel`.
+    - Completion just before close leaves the job `complete` (race 4).
+    - `DELETE` and disconnect nearly simultaneous produce one cleanup and a 204 (race 1).
+    - Repeated `DELETE` returns 204.
+    - `DELETE` after `complete` keeps the file and download still works.
+    - Download of `cancelled`/`failed` returns 409.
+    - Unknown-job `DELETE` returns 404.
+  - [ ] 31.3 Hook/UI test: the Cancel button is disabled before the job ID arrives, then sends `DELETE` during rendering.
+  - [ ] 31.4 Update existing tests for the `createJob`/`run` split and the routes mock. Properties 1–17 must still pass.
+  - [ ] 31.5 Type-check (0 errors), full suite, build, governed-literal scan (`KILL_GRACE_MS` derived from `cancelTimeoutSeconds`), `git diff --check`, traceability (Req 4 numbered 1–22, Properties 1–18).
+  - [ ] 31.6 Mutation checks, each of which must fail tests:
+    - no `kill`;
+    - no `SIGKILL` escalation;
+    - `SIGKILL` sent unconditionally;
+    - completion without compare-and-set;
+    - no frame-loop abort;
+    - disconnect not cancelling;
+    - disconnect cancelling a terminal job;
+    - `DELETE` deleting a complete file;
+    - no job-ID-first event;
+    - error event on cancel.
+  - [ ] 31.7 One local manual end-to-end run with real ffmpeg (no GitHub): start a render, cancel it mid-encode through `DELETE`, record the ffmpeg child PID, then confirm the process is no longer alive (`process.kill(pid, 0)` → `ESRCH`), the file is deleted, the status is `cancelled`, and download returns 409.
+  - [ ] 31.8 Fill the verification table, clean up temporary files, commit as planned.
+
+## Task Dependency Graph
+
+```json
+{
+  "waves": [
+    { "id": 0, "tasks": ["28.1", "28.2", "28.3"] },
+    { "id": 1, "tasks": ["28.4", "28.5"] },
+    { "id": 2, "tasks": ["29.1", "29.2", "29.3", "29.4", "30.1", "30.2"] },
+    { "id": 3, "tasks": ["31.1", "31.2", "31.3", "31.4"] },
+    { "id": 4, "tasks": ["31.5", "31.6", "31.7", "31.8"] }
+  ]
+}
+```
+
+## Notes
+
+- One cancellation implementation (`cancel`) serves `DELETE`, client disconnect, and internal paths. Neither route duplicates the cleanup logic.
+- `KILL_GRACE_MS` is derived from the governed `cancelTimeoutSeconds`; no new governed constants.
+- Cancellation records stay in `jobs` so repeated `DELETE` returns 204. Sweeping old cancelled/failed records is not part of this change.
+- No GitHub API usage in this cycle.
+
+## Correctness Properties Verification (Render Cancellation Lifecycle)
+
+| # | Property | Result | Evidence |
+|---|----------|--------|----------|
+| 1–5, 7–17 | Unchanged properties | Pending | Re-run of the full suite |
+| 6 | Cancellation Terminates Rendering Within the Timeout | Pending | 31.1 (signals, frame stop, file deletion, timeout, late `end`/`error`), 31.2 (download 409), 31.7 (real process). Previous PASS covered file deletion and timing only |
+| 18 | Render Job Lifecycle Has One Outcome | Pending | 31.1 (races 2, 3, 5–8), 31.2 (job ID first, races 1 and 4, idempotent `DELETE`, no late events), 31.3 (UI) |
