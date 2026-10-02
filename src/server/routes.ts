@@ -4,14 +4,14 @@
  * This module owns HTTP routing and error mapping only. All business logic
  * is delegated to the appropriate domain module:
  *   - analyzeRepository  → src/server/analyzer.ts
- *   - generateStoryboard → src/server/storyboard.ts
+ *   - buildStoryboardForUrl → src/server/pipeline.ts (analysis → selection → lookup → storyboard)
  *   - videoRenderer      → src/server/renderer.ts
  */
 
 import { Router, Request, Response, NextFunction } from "express";
 import fs from "fs";
 import { analyzeRepository, validateAndExtractTokens } from "./analyzer.js";
-import { generateStoryboard } from "./storyboard.js";
+import { buildStoryboardForUrl } from "./pipeline.js";
 import { videoRenderer } from "./renderer.js";
 import { analysisCache, AnalysisCache } from "./cache.js";
 import { VIDEO_CONFIG } from "../config/output.js";
@@ -106,14 +106,13 @@ router.post(
 /**
  * Generate a storyboard for a repository URL.
  *
- * Validates the URL and derives the same `owner/repo` cache key used by
- * `/api/analyze`. On a cache hit the cached analysis is used directly. If the
- * entry has expired or was never present, the analysis is re-run so the flow
- * does not dead-end after the TTL window.
+ * Transport boundary only: reads the `url` query parameter and delegates to
+ * {@link buildStoryboardForUrl}, which owns caching, analysis, deep-dive
+ * selection, the lazy selected-PR lookup, and generation.
  *
  * @remarks
- * Requires the `url` query parameter. May make GitHub API calls when the
- * cached analysis is absent or expired.
+ * Requires the `url` query parameter. May make up to 15 GitHub API calls on a
+ * cache miss; a cache hit whose evidence is already gathered makes none.
  */
 router.get(
   "/storyboard",
@@ -128,22 +127,8 @@ router.get(
         return;
       }
 
-      // Validate and derive the token-based key (never key on the raw URL).
-      const { owner, repo } = validateAndExtractTokens(url);
-      const cacheKey = AnalysisCache.keyFor(owner, repo);
-
-      // Use the cached analysis when available; otherwise re-analyze
-      // (handles TTL expiry gracefully). Only cache clean results.
-      let analysis = analysisCache.get(cacheKey);
-      if (!analysis) {
-        const fresh = await analyzeRepository(url);
-        if (fresh.partialFailures.length === 0) {
-          analysisCache.set(cacheKey, fresh);
-        }
-        analysis = fresh;
-      }
-
-      const slides = generateStoryboard(analysis);
+      // Transport only: the pipeline owns caching, analysis, selection, lookup, and generation.
+      const slides = await buildStoryboardForUrl(url);
       res.status(200).json(slides);
     } catch (err: unknown) {
       next(err);
@@ -172,6 +157,8 @@ router.get(
 router.post(
   "/render",
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    // Set on completion, error, or client disconnect; no SSE write after that (Req 4.18).
+    let closed = false;
     try {
       const { slides, targetDurationSeconds } = req.body as {
         slides?: unknown;
@@ -213,9 +200,12 @@ router.post(
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
+      res.on("close", () => {
+        closed = true;
+      });
 
       const onProgress = (percent: number): void => {
-        if (!res.writableEnded) {
+        if (!closed && !res.writableEnded) {
           res.write(`data: ${JSON.stringify({ percent })}\n\n`);
         }
       };
@@ -226,14 +216,19 @@ router.post(
         validatedDuration,
       );
 
-      if (!res.writableEnded) {
+      // The single terminal event (Req 4.17).
+      if (!closed && !res.writableEnded) {
+        closed = true;
         res.write(
           `data: ${JSON.stringify({ percent: 100, jobId: job.id })}\n\n`,
         );
         res.end();
       }
+      closed = true;
     } catch (err: unknown) {
-      if (res.writableEnded) {
+      const alreadyClosed = closed;
+      closed = true;
+      if (res.writableEnded || (alreadyClosed && res.headersSent)) {
         // Response already completed — nothing more can be sent, and handing
         // the error to Express here would only trigger a spurious
         // "headers already sent" warning. The error is already handled.

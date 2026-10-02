@@ -17,6 +17,8 @@ import {
   fetchPullRequests,
   fetchReleases,
   selectSpecPaths,
+  fetchSelectedPrCommits,
+  MAX_SELECTED_PR_LOOKUPS,
   analyzeRepository,
   computeRateLimitWaitSeconds,
   formatRateLimitMessage,
@@ -802,5 +804,118 @@ describe("rate-limit message reflects response headers", () => {
         message: expect.stringContaining("minute"),
       }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parents / mergeCommitSha mapping (Req 2.4, 2.8)
+// ---------------------------------------------------------------------------
+
+describe("commit parents and PR merge commit mapping", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("maps parents[].sha, defaulting to []", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse([
+      { sha: "m", commit: { author: { name: "A", date: "t" }, message: "merge" }, parents: [{ sha: "p1" }, { sha: "p2" }] },
+      { sha: "r", commit: { author: { name: "A", date: "t" }, message: "root" } },
+    ])));
+    const [m, r] = await fetchCommits("owner", "repo");
+    expect(m?.parents).toEqual(["p1", "p2"]);
+    expect(r?.parents).toEqual([]);
+  });
+
+  it("maps merge_commit_sha, defaulting to null", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockResponse([
+      { number: 1, title: "a", merged_at: "t", merge_commit_sha: "abc", labels: [], user: { type: "User" } },
+      { number: 2, title: "b", merged_at: "t", labels: [], user: { type: "User" } },
+    ])));
+    const prs = await fetchPullRequests("owner", "repo");
+    expect(prs.map((p) => p.mergeCommitSha)).toEqual(["abc", null]);
+  });
+
+  it("analysis steps 1–7 still make the same requests (no PR-commit lookups)", async () => {
+    const fetchMock = routedFetch(happyRoutes());
+    vi.stubGlobal("fetch", fetchMock);
+    await analyzeRepository("https://github.com/owner/repo");
+    const paths = fetchMock.mock.calls.map(([u]) => new URL(String(u)).pathname).sort();
+    expect(paths).toEqual([R, `${R}/commits`, `${R}/git/trees/HEAD`, `${R}/pulls`, `${R}/readme`, `${R}/releases`].sort());
+    expect(paths.some((p) => /\/pulls\/\d+\/commits$/.test(p))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchSelectedPrCommits — lazy, bounded, fail-safe (Req 2.11, 2.12; Property 17)
+// ---------------------------------------------------------------------------
+
+describe("fetchSelectedPrCommits", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const prCommits = (n: number): Response => mockResponse([{ sha: `${n}-a` }, { sha: `${n}-b` }]);
+  const okFetch = () =>
+    vi.fn(async (u: string | URL): Promise<Response> => prCommits(Number(/\/pulls\/(\d+)\/commits/.exec(String(u))![1])));
+
+  it("makes 0 requests for an empty list", async () => {
+    const f = okFetch();
+    vi.stubGlobal("fetch", f);
+    expect(await fetchSelectedPrCommits("owner", "repo", [])).toEqual({});
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 2, 3])("makes at most N requests for N numbers (N = %i)", async (n) => {
+    const f = okFetch();
+    vi.stubGlobal("fetch", f);
+    const nums = Array.from({ length: n }, (_, i) => i + 1);
+    const ev = await fetchSelectedPrCommits("owner", "repo", nums);
+    expect(f.mock.calls.length).toBeLessThanOrEqual(n);
+    expect(Object.keys(ev).map(Number).sort()).toEqual(nums);
+  });
+
+  it(`caps lookups at MAX_SELECTED_PR_LOOKUPS (${MAX_SELECTED_PR_LOOKUPS})`, async () => {
+    const f = okFetch();
+    vi.stubGlobal("fetch", f);
+    await fetchSelectedPrCommits("owner", "repo", [1, 2, 3, 4, 5]);
+    expect(f).toHaveBeenCalledTimes(MAX_SELECTED_PR_LOOKUPS);
+  });
+
+  it("fetches duplicates once and drops invalid numbers before building any URL", async () => {
+    const f = okFetch();
+    vi.stubGlobal("fetch", f);
+    await fetchSelectedPrCommits("owner", "repo", [7, 7, 0, -1, 1.5, Number.NaN, 2 ** 60]);
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the exact endpoint and only api.github.com", async () => {
+    const f = okFetch();
+    vi.stubGlobal("fetch", f);
+    const ev = await fetchSelectedPrCommits("owner", "repo", [42]);
+    expect(String(f.mock.calls[0]![0])).toBe("https://api.github.com/repos/owner/repo/pulls/42/commits?per_page=100");
+    expect(ev).toEqual({ 42: ["42-a", "42-b"] });
+  });
+
+  it.each([
+    ["timeout", (): Response | Error => Object.assign(new Error("aborted"), { name: "AbortError" })],
+    ["500", (): Response | Error => mockResponse("boom", 500)],
+    ["429", (): Response | Error => mockResponse("slow down", 429)],
+    ["malformed JSON", (): Response | Error => mockResponse("{not json")],
+    ["redirect", (): Response | Error => mockResponse("", 302)],
+  ])("a %s for one PR omits only that PR and never throws", async (_label, failure) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal("fetch", vi.fn(async (u: string | URL) => {
+      const n = Number(/\/pulls\/(\d+)\/commits/.exec(String(u))![1]);
+      if (n === 2) {
+        const v = failure();
+        if (v instanceof Error) throw v;
+        return v;
+      }
+      return prCommits(n);
+    }));
+    const ev = await fetchSelectedPrCommits("owner", "repo", [1, 2, 3]);
+    expect(Object.keys(ev).map(Number).sort()).toEqual([1, 3]);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

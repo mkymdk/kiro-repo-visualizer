@@ -10,6 +10,7 @@ import {
   ApiError,
   Commit,
   DirectoryNode,
+  PrCommitEvidence,
   PullRequest,
   Release,
   RepoAnalysisResult,
@@ -52,6 +53,12 @@ const MAX_SPEC_FILES = 6;
 
 /** Maximum characters kept from a pull request or release body. */
 const MAX_CHANGE_BODY_CHARS = 10_000;
+
+/** Maximum selected-PR commit lookups per analysis (Req 2.11). A request limit, not an output constant. */
+export const MAX_SELECTED_PR_LOOKUPS = 3;
+
+/** Commits requested per selected-PR lookup (one page). */
+const PR_COMMITS_PER_PAGE = 100;
 
 /** Spec documents must be Markdown files under `.kiro/specs/`. */
 const SPEC_PATH_RE = /^\.kiro\/specs\/.+\.md$/i;
@@ -538,6 +545,9 @@ export async function fetchCommits(
       subject,
       body,
       message: subject,
+      parents: asRecordArray(item["parents"])
+        .map((p) => p["sha"])
+        .filter((s): s is string => typeof s === "string" && s.length > 0),
     };
   });
 }
@@ -646,6 +656,7 @@ export async function fetchPullRequests(
           .filter((l) => l.length > 0),
         mergedAt: item["merged_at"] as string,
         isBot: user["type"] === "Bot" || login.endsWith("[bot]"),
+        mergeCommitSha: stringOrNull(item["merge_commit_sha"]),
       };
     });
 }
@@ -683,6 +694,75 @@ export async function fetchReleases(
       publishedAt: item["published_at"] as string,
       body: String(item["body"] ?? "").slice(0, MAX_CHANGE_BODY_CHARS),
     }));
+}
+
+/**
+ * Fetch the commit SHAs of one pull request (single page).
+ *
+ * @param owner - Validated GitHub owner login.
+ * @param repo - Validated GitHub repository name.
+ * @param prNumber - A positive safe integer PR number.
+ * @returns Commit SHAs exactly as GitHub returned them.
+ * @throws {@link ApiError} On any non-2xx, rate-limit, timeout, redirect, or network failure.
+ *
+ * @remarks
+ * Makes one outbound HTTPS request to `api.github.com`.
+ */
+async function fetchPullRequestCommitShas(
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const response = await safeFetch(
+    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/commits?per_page=${PR_COMMITS_PER_PAGE}`,
+  );
+  throwIfRateLimited(response);
+  throwIfNotOk(response);
+  return asRecordArray(await readJson(response))
+    .map((c) => c["sha"])
+    .filter((s): s is string => typeof s === "string" && s.length > 0);
+}
+
+/**
+ * Lazily fetch PR_Commit_Evidence for Selected_PRs (design step 8, Req 2.11, 2.12).
+ *
+ * Only the first `MAX_SELECTED_PR_LOOKUPS` distinct, valid PR numbers are
+ * fetched, one request each; an empty list makes no request. Each lookup is
+ * isolated: any failure leaves that PR out of the result. This function never
+ * throws, so a lookup can never fail analysis or storyboard generation.
+ *
+ * @param owner - Validated GitHub owner login.
+ * @param repo - Validated GitHub repository name.
+ * @param prNumbers - PR numbers chosen by the storyboard pipeline (untrusted).
+ * @returns Evidence for the PRs whose lookup succeeded.
+ *
+ * @remarks
+ * Makes at most `MAX_SELECTED_PR_LOOKUPS` outbound HTTPS requests to
+ * `api.github.com`. Failures are logged server-side.
+ */
+export async function fetchSelectedPrCommits(
+  owner: string,
+  repo: string,
+  prNumbers: number[],
+): Promise<PrCommitEvidence> {
+  const numbers = [...new Set(prNumbers.filter((n) => Number.isSafeInteger(n) && n > 0))].slice(
+    0,
+    MAX_SELECTED_PR_LOOKUPS,
+  );
+  const evidence: PrCommitEvidence = {};
+  const results = await Promise.allSettled(
+    numbers.map((n) => fetchPullRequestCommitShas(owner, repo, n)),
+  );
+  results.forEach((r, i) => {
+    const n = numbers[i]!;
+    if (r.status === "fulfilled") {
+      evidence[n] = r.value;
+    } else {
+      const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      console.warn(`[analyzer] selected-PR lookup #${n} skipped: ${reason}`);
+    }
+  });
+  return evidence;
 }
 
 // ---------------------------------------------------------------------------

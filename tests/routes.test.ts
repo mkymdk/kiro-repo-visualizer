@@ -183,3 +183,113 @@ describe("POST /api/render — targetDurationSeconds validation", () => {
     expect(videoRenderer.start).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// POST /api/render — SSE sink (Req 4.17, 4.18; Property 16)
+// ---------------------------------------------------------------------------
+
+import { EventEmitter } from "events";
+import type { ProgressCallback } from "../src/server/renderer.js";
+
+/** Minimal Express-like response that records SSE writes. */
+class FakeSseResponse extends EventEmitter {
+  writes: string[] = [];
+  headersSent = false;
+  writableEnded = false;
+  statusCode = 200;
+  setHeader(): void {}
+  flushHeaders(): void {
+    this.headersSent = true;
+  }
+  write(chunk: string): boolean {
+    if (this.writableEnded) throw new Error("write after end");
+    this.writes.push(chunk);
+    return true;
+  }
+  end(): void {
+    this.writableEnded = true;
+  }
+  status(code: number): this {
+    this.statusCode = code;
+    return this;
+  }
+  json(): this {
+    this.writableEnded = true;
+    return this;
+  }
+  /** Parsed SSE data payloads. */
+  events(): Record<string, unknown>[] {
+    return this.writes.map((w) => JSON.parse(w.replace(/^data: /, "").trim()) as Record<string, unknown>);
+  }
+}
+
+/** The real POST /render handler from the router stack. */
+function renderHandler(): (req: unknown, res: unknown, next: (e?: unknown) => void) => Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Express internals have no public types
+  const layer = (router as any).stack.find((l: any) => l.route?.path === "/render" && l.route.methods.post);
+  return layer.route.stack[0].handle;
+}
+
+describe("POST /api/render — SSE sink", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("sends exactly one terminal percent:100 event with the jobId, last", async () => {
+    let sink: ProgressCallback = () => {};
+    vi.mocked(videoRenderer.start).mockImplementation(async (_s, onProgress) => {
+      sink = onProgress;
+      onProgress(0);
+      onProgress(40);
+      onProgress(99);
+      return completedJob();
+    });
+    const res = new FakeSseResponse();
+    const next = vi.fn();
+    await renderHandler()({ body: { slides: sampleSlides } }, res, next);
+    const evs = res.events();
+    expect(evs.filter((e) => e["percent"] === 100)).toEqual([{ percent: 100, jobId: "job-1" }]);
+    expect(evs[evs.length - 1]).toEqual({ percent: 100, jobId: "job-1" });
+    expect(res.writableEnded).toBe(true);
+
+    // A late progress callback after completion writes nothing.
+    sink(55);
+    expect(res.events()).toHaveLength(evs.length);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("after an error, sends one error event and nothing more", async () => {
+    let sink: ProgressCallback = () => {};
+    vi.mocked(videoRenderer.start).mockImplementation(async (_s, onProgress) => {
+      sink = onProgress;
+      onProgress(10);
+      throw new Error("encoder crashed");
+    });
+    const res = new FakeSseResponse();
+    const next = vi.fn();
+    await renderHandler()({ body: { slides: sampleSlides } }, res, next);
+    expect(res.events()).toEqual([{ percent: 10 }, { error: "encoder crashed" }]);
+    sink(20);
+    expect(res.events()).toHaveLength(2);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("after the client disconnects, writes nothing more — not even the terminal event", async () => {
+    let release: () => void = () => {};
+    let sink: ProgressCallback = () => {};
+    vi.mocked(videoRenderer.start).mockImplementation(async (_s, onProgress) => {
+      sink = onProgress;
+      onProgress(5);
+      await new Promise<void>((r) => (release = r));
+      return completedJob();
+    });
+    const res = new FakeSseResponse();
+    const done = renderHandler()({ body: { slides: sampleSlides } }, res, vi.fn());
+    await Promise.resolve();
+    res.emit("close"); // client went away
+    sink(50);
+    release();
+    await done;
+    expect(res.events()).toEqual([{ percent: 5 }]);
+  });
+});
