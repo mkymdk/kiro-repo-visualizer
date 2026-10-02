@@ -113,6 +113,28 @@ function normalize(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+/**
+ * A GitHub-style emoji shortcode (`:muscle:`, `:+1:`), not directly adjacent to
+ * a letter, digit, or colon so that times (`10:30:45`), IPv6 addresses
+ * (`2001:db8::1`), and `std::vector` are left intact. The name must contain a
+ * letter, or be exactly `+1` / `-1`.
+ */
+const EMOJI_SHORTCODE_RE = /(?<![A-Za-z0-9:]):(?:[a-z0-9_+-]*[a-z][a-z0-9_+-]*|\+1|-1):(?![A-Za-z0-9:])/g;
+
+/**
+ * Remove GitHub-style Emoji_Shortcodes from prose text (B6a, Req 3.14).
+ *
+ * @param text - Any prose text; may contain newlines.
+ * @returns The text with shortcodes removed, whitespace collapsed per line,
+ *   and line breaks preserved. Non-shortcode colon syntax is left unchanged.
+ */
+export function stripEmojiShortcodes(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.replace(EMOJI_SHORTCODE_RE, "").replace(/[ \t]{2,}/g, " ").replace(/[ \t]+$/g, "").replace(/^[ \t]+/g, ""))
+    .join("\n");
+}
+
 /** ISO 8601 timestamp → `YYYY-MM-DD`. */
 function isoDate(timestamp: string): string {
   return timestamp.slice(0, 10);
@@ -175,9 +197,9 @@ function scanLines(md: string): ScannedLine[] {
   return out;
 }
 
-/** Heading text with leading emoji/punctuation and trailing colon removed, for matching. */
+/** Heading text with leading shortcodes/emoji/punctuation and trailing colon removed, for matching. */
 function headingKey(heading: string): string {
-  return heading.replace(/^[^A-Za-z0-9]+/, "").replace(/[:\s]+$/, "");
+  return stripEmojiShortcodes(heading).replace(/^[^A-Za-z0-9]+/, "").replace(/[:\s]+$/, "");
 }
 
 /**
@@ -300,16 +322,35 @@ export function firstParagraph(md: string): string {
  * @param title - Raw title text.
  * @param body - Raw body text; may contain newlines.
  * @param preview - Optional raw preview text; derived from `body` when omitted.
+ * @param literalBody - When true, the body is literal content (e.g. fenced-code
+ *   Run steps) that is escaped but not shortcode-stripped, so commands and
+ *   examples are preserved verbatim (B6a). Defaults to false.
  * @returns A {@link Slide} with a new UUID and HTML-escaped `title`, `body`,
- *   and `previewSummary` (capped at `SLIDE_CONFIG.previewMaxWords` words).
+ *   and `previewSummary` (capped at `SLIDE_CONFIG.previewMaxWords` words), with
+ *   Emoji_Shortcodes removed from prose fields.
  */
-function makeSlide(type: SlideType, title: string, body: string, preview?: string): Slide {
-  const plainPreview = (preview ?? body).replace(/^[•\s]+/gm, "").replace(/\s+/g, " ");
+function makeSlide(type: SlideType, title: string, body: string, preview?: string, literalBody = false): Slide {
+  const cleanTitle = stripEmojiShortcodes(title);
+  const cleanBody = literalBody
+    ? body
+    : body
+        .split("\n")
+        .map((line) => ({ original: line, stripped: stripEmojiShortcodes(line) }))
+        // Drop a line only when stripping a shortcode emptied a previously non-empty line.
+        .filter(({ original, stripped }) => {
+          const hadContent = original.trim() !== "" && original.trim() !== "•";
+          const nowEmpty = stripped.trim() === "" || stripped.trim() === "•";
+          return !(hadContent && nowEmpty);
+        })
+        .map(({ stripped }) => stripped)
+        .join("\n");
+  const previewSource = preview !== undefined ? stripEmojiShortcodes(preview) : cleanBody;
+  const plainPreview = previewSource.replace(/^[•\s]+/gm, "").replace(/\s+/g, " ");
   return {
     id: randomUUID(),
     type,
-    title: htmlEscape(title),
-    body: htmlEscape(body),
+    title: htmlEscape(cleanTitle),
+    body: htmlEscape(cleanBody),
     previewSummary: htmlEscape(truncateToWords(plainPreview, SLIDE_CONFIG.previewMaxWords)),
   };
 }
@@ -317,6 +358,47 @@ function makeSlide(type: SlideType, title: string, body: string, preview?: strin
 // ---------------------------------------------------------------------------
 // Act 1 — What is this repository?
 // ---------------------------------------------------------------------------
+
+/**
+ * Normalized comparison key for overview deduplication (B6b, Req 5.12).
+ *
+ * Strips Emoji_Shortcodes and inline Markdown, removes an exact leading
+ * repository name followed by structural punctuation (`:`, `-`, `–`, `—`, `,`),
+ * then applies {@link normalize}. No wording transform (such as a leading
+ * "is") is performed.
+ *
+ * @param text - A sentence or description.
+ * @param repo - Repository name.
+ * @returns The comparison key.
+ */
+function overviewKey(text: string, repo: string): string {
+  const plain = stripEmojiShortcodes(toPlainText(text));
+  const prefix = new RegExp(`^\\s*${repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:\\-–—,]\\s*`, "i");
+  return normalize(plain.replace(prefix, ""));
+}
+
+/**
+ * Drop README paragraph sentences that duplicate the repository description
+ * (B6b, Req 5.12). Uses deterministic normalized-equality comparison only; a
+ * sentence that adds meaningful words is kept.
+ *
+ * @param paragraph - The first README prose paragraph (untruncated).
+ * @param description - The repository description.
+ * @param repo - Repository name.
+ * @returns The paragraph with duplicate sentences removed; "" when none remain.
+ */
+function dedupeParagraph(paragraph: string, description: string, repo: string): string {
+  if (!paragraph) return "";
+  const dupKeys = new Set<string>([
+    overviewKey(description, repo),
+    ...firstSentences(description, Number.MAX_SAFE_INTEGER).map((s) => overviewKey(s, repo)),
+  ]);
+  dupKeys.delete("");
+  const kept = firstSentences(paragraph, Number.MAX_SAFE_INTEGER).filter(
+    (s) => !dupKeys.has(overviewKey(s, repo)),
+  );
+  return kept.join(" ").trim();
+}
 
 /**
  * Build the overview slide.
@@ -334,12 +416,9 @@ export function buildIntroSlide(
   metadata: RepoMetadata | null = null,
 ): Slide {
   const description = metadata?.description?.trim() ?? "";
-  let paragraph = readmeText
-    ? truncateToWords(firstParagraph(readmeText), SLIDE_CONFIG.introMaxWords)
-    : "";
-  if (paragraph && description && normalize(paragraph) === normalize(description)) {
-    paragraph = "";
-  }
+  const rawParagraph = readmeText ? firstParagraph(readmeText) : "";
+  const deduped = description ? dedupeParagraph(rawParagraph, description, repo) : rawParagraph;
+  const paragraph = truncateToWords(deduped, SLIDE_CONFIG.introMaxWords);
 
   const lines: string[] = [];
   if (description) lines.push(description);
@@ -436,8 +515,8 @@ export function capabilitiesOverlapFeatures(capabilities: string[], features: Ke
 // Act 3 — How do I run it?
 // ---------------------------------------------------------------------------
 
-/** README headings that introduce run instructions. */
-const RUN_HEADING_RE = /^(installation|getting started|setup|usage|quick start)\b/i;
+/** README headings that introduce run instructions (B4, Req 5.7). */
+const RUN_HEADING_RE = /^(install|installation|getting started|setup|usage|quick start|examples?)\b/i;
 
 /**
  * Build the "how to run this repository" slide from README content.
@@ -467,19 +546,20 @@ export function buildRunSlide(readmeText: string | null): Slide | null {
     if (inFirstFence) codeLines.push(l.text);
   }
 
-  const rawSteps =
-    sawFence && codeLines.some((s) => s.trim().length > 0)
-      ? codeLines.filter((s) => s.trim().length > 0)
-      : section.lines
-          .filter((l) => !l.inFence && l.text.trim().length > 0)
-          .map((l) => l.text.trim());
+  const fromCode = sawFence && codeLines.some((s) => s.trim().length > 0);
+  const rawSteps = fromCode
+    ? codeLines.filter((s) => s.trim().length > 0)
+    : section.lines
+        .filter((l) => !l.inFence && l.text.trim().length > 0)
+        .map((l) => l.text.trim());
 
   const steps = rawSteps
     .slice(0, SLIDE_CONFIG.runMaxSteps)
     .map((s) => truncateToWords(s, SLIDE_CONFIG.runMaxWordsPerStep));
   if (steps.length === 0) return null;
 
-  return makeSlide("run", `How to run: ${section.heading}`, steps.join("\n"));
+  // Code-block steps are literal commands/examples: escape but never shortcode-strip them (B6a).
+  return makeSlide("run", `How to run: ${section.heading}`, steps.join("\n"), undefined, fromCode);
 }
 
 // ---------------------------------------------------------------------------
@@ -776,17 +856,46 @@ export const GENERIC_TERMS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * English month names and common abbreviations treated as calendar noise (B5).
+ * Algorithm data per design.md, not a governed constant.
+ */
+export const CALENDAR_TERMS: ReadonlySet<string> = new Set([
+  "january", "february", "march", "april", "may", "june", "july", "august",
+  "september", "october", "november", "december",
+  "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+]);
+
+/**
+ * Decide whether a token is a Calendar_Term (B5, Req 7.22): a four-digit year
+ * from 1900–2099, or an English month name/abbreviation. Mixed alphanumeric
+ * tokens are never calendar terms because they are not pure digits or letters.
+ *
+ * @param token - A lowercase relevance token.
+ * @returns True when the token is calendar noise.
+ */
+export function isCalendarTerm(token: string): boolean {
+  if (/^(19|20)\d{2}$/.test(token)) return true;
+  return CALENDAR_TERMS.has(token);
+}
+
+/**
  * Tokenize text into relevance terms.
  *
  * @param text - Any text.
  * @returns Lowercase alphanumeric tokens of at least
- *   `SLIDE_CONFIG.relevanceMinTermLength` characters, excluding {@link GENERIC_TERMS}.
+ *   `SLIDE_CONFIG.relevanceMinTermLength` characters, excluding
+ *   {@link GENERIC_TERMS} and Calendar_Terms ({@link isCalendarTerm}).
  */
 export function relevanceTokens(text: string): string[] {
   return text
     .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= SLIDE_CONFIG.relevanceMinTermLength && !GENERIC_TERMS.has(t));
+    .filter(
+      (t) =>
+        t.length >= SLIDE_CONFIG.relevanceMinTermLength &&
+        !GENERIC_TERMS.has(t) &&
+        !isCalendarTerm(t),
+    );
 }
 
 /**
@@ -952,20 +1061,146 @@ export function rankSignificantPullRequests(pullRequests: PullRequest[]): Ranked
   );
 }
 
+/** A parsed semantic version core with optional prerelease/build. */
+export interface SemanticVersion {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string | null;
+  build: string | null;
+}
+
 /**
- * Decide whether a release is a Patch_Release (`X.Y.Z` / `vX.Y.Z`, Z > 0).
+ * SemVer core/prerelease/build, anchored, applied after the tag-boundary strip.
+ * Numeric identifiers reject leading zeros; prerelease identifiers are
+ * unrestricted ASCII alphanumerics/hyphens (no label vocabulary).
+ */
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+
+/**
+ * Tag boundaries where a version core may begin, each requiring a following
+ * digit so the boundary never consumes a version's own prerelease hyphen:
+ *   - the start of the tag, optionally with `v`/`V`;
+ *   - a `/`, `@`, or `_` separator, optionally with `v`/`V`;
+ *   - any `-`, `_`, `/`, `@` separator that is followed by `v`/`V`.
+ * A bare `-` separator is deliberately not a boundary: it cannot be told apart
+ * from a prerelease hyphen, so `node-1.2.3-compat` is rejected while
+ * `release-v1.2.3` (the `-` is followed by `v`) is accepted.
+ */
+const TAG_BOUNDARY_RE = /(?:^[vV]?|[/@_][vV]?|[-_/@][vV])(?=\d)/g;
+
+/**
+ * Parse a release tag into a Semantic_Version_Tag (B1, Req 7.19).
+ *
+ * Tries each permitted version boundary (start of tag, or after `-`, `_`, `/`,
+ * `@`, with an optional `v`/`V`) and validates the complete SemVer
+ * core/prerelease/build anchored to the end of the tag, with no trailing text
+ * and no prerelease-label allowlist.
+ *
+ * @param tag - A release tag.
+ * @returns The parsed {@link SemanticVersion}, or null when the tag is not a
+ *   Semantic_Version_Tag.
+ */
+export function parseSemanticVersionTag(tag: string): SemanticVersion | null {
+  const trimmed = tag.trim();
+  for (const boundary of trimmed.matchAll(TAG_BOUNDARY_RE)) {
+    const candidate = trimmed.slice(boundary.index + boundary[0].length);
+    const m = SEMVER_RE.exec(candidate);
+    if (m) {
+      return {
+        major: Number(m[1]),
+        minor: Number(m[2]),
+        patch: Number(m[3]),
+        prerelease: m[4] ?? null,
+        build: m[5] ?? null,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Decide whether a release is a Patch_Release: its tag is a
+ * Semantic_Version_Tag whose core patch component is greater than 0 (B1).
+ * Prerelease and build suffixes do not affect the decision.
  *
  * @param release - A release.
  * @returns True for patch releases.
  */
 export function isPatchRelease(release: Release): boolean {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(release.tagName);
-  return m !== null && Number(m[3]) > 0;
+  const parsed = parseSemanticVersionTag(release.tagName);
+  return parsed !== null && parsed.patch > 0;
 }
 
-/** Display title of a release. */
+/** Release-note sections whose bodies are maintenance noise (B2). */
+const RELEASE_NOISE_SECTIONS = new Set(["new contributors", "contributors", "full changelog", "checksums"]);
+
+/**
+ * Remove maintenance noise from release notes before Change_Context extraction
+ * (B2, Req 7.20): drops changelog/contributor sections, converts Markdown links
+ * to their text, and strips URLs, generated attributions, standalone commit
+ * hashes, and parenthesized issue/PR reference lists. Prose is preferred; when
+ * only list items remain, the first cleaned item is kept.
+ *
+ * @param body - Raw release notes.
+ * @returns Cleaned text suitable for {@link extractChangeContext}; "" when
+ *   nothing meaningful remains.
+ */
+export function cleanReleaseNotes(body: string): string {
+  const prose: string[] = [];
+  const items: string[] = [];
+  let skipUntilLevel: number | null = null;
+
+  for (const l of scanLines(body)) {
+    if (l.headingLevel !== null) {
+      if (skipUntilLevel !== null && l.headingLevel <= skipUntilLevel) skipUntilLevel = null;
+      const key = headingKey(l.headingText ?? "").toLowerCase();
+      if (skipUntilLevel === null && RELEASE_NOISE_SECTIONS.has(key)) skipUntilLevel = l.headingLevel;
+      continue;
+    }
+    if (skipUntilLevel !== null || l.inFence) continue;
+    const t = l.text.trim();
+    if (t === "") continue;
+    if (/^full changelog\b/i.test(toPlainText(t))) continue;
+
+    const isItem = LIST_ITEM_RE.test(l.text);
+    const cleaned = cleanReleaseLine(l.text);
+    if (!cleaned) continue;
+    if (isItem) items.push(cleaned);
+    else prose.push(cleaned);
+  }
+
+  if (prose.length > 0) return prose.join(" ");
+  return items.length > 0 ? items[0]! : "";
+}
+
+/** Remove link/url/hash/reference noise from one release-note line (B2). */
+function cleanReleaseLine(raw: string): string {
+  let t = raw.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").replace(/^>\s?/, "");
+  // Markdown + reference links → their text.
+  t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1");
+  // Generated attribution: "by @login" with optional "in <url-or-#ref>".
+  t = t.replace(/\bby\s+@[A-Za-z0-9-]+(?:\s+in\s+\S+)?\s*$/i, "");
+  // Autolinks and bare URLs, with an immediately preceding in/at/see/via.
+  t = t.replace(/\b(?:in|at|see|via)\s+<https?:\/\/[^>\s]+>/gi, "").replace(/<https?:\/\/[^>\s]+>/g, "");
+  t = t.replace(/\b(?:in|at|see|via)\s+https?:\/\/\S+/gi, "").replace(/https?:\/\/\S+/g, "");
+  // Standalone commit hashes (7–40 hex with at least one digit and one a–f letter).
+  const HASH = "(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,40}";
+  t = t.replace(new RegExp("`" + HASH + "`", "g"), ""); // backticked
+  t = t.replace(new RegExp("\\(" + HASH + "\\)", "g"), ""); // parenthesized
+  t = t.replace(new RegExp("(?<![0-9A-Za-z])" + HASH + "(?![0-9A-Za-z])", "g"), ""); // bare word
+  // Parenthesized reference lists: (#12), (#12, #13), (owner/repo#12), (GH-12).
+  t = t.replace(/\((?:[A-Za-z0-9_./-]*#\d+|GH-\d+)(?:\s*,\s*(?:[A-Za-z0-9_./-]*#\d+|GH-\d+))*\)/g, "");
+  // Tidy leftovers.
+  t = t.replace(/\(\s*\)|\[\s*\]/g, "").replace(/\s{2,}/g, " ").replace(/^[\s,:–—-]+|[\s,:–—-]+$/g, "").trim();
+  return /[A-Za-z]/.test(t) ? t : "";
+}
+
+/** Display title of a release, with Emoji_Shortcodes removed before the tag fallback. */
 function releaseTitle(release: Release): string {
-  return release.name?.trim() || release.tagName;
+  const name = stripEmojiShortcodes(release.name ?? "").trim();
+  return name || release.tagName;
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1309,19 @@ export function buildChangeGroups(commits: Commit[], pullRequests: PullRequest[]
 /** Conventional `feat` type, the only commits allowed in the empty-anchor fallback. */
 const FEAT_COMMIT_RE = /^feat(\([^)]*\))?!?:/i;
 
+/** Conventional `docs` type (`docs:`, `docs(scope):`, `docs!:`, `docs(scope)!:`), case-insensitive. */
+const DOCS_COMMIT_RE = /^\s*docs(\([^)]*\))?!?:/i;
+
+/**
+ * Decide whether a commit subject is documentation-only (B3, Req 7.21).
+ *
+ * @param subject - A commit subject line.
+ * @returns True for the conventional `docs` type at the start of the subject.
+ */
+export function isDocsCommit(subject: string): boolean {
+  return DOCS_COMMIT_RE.test(subject);
+}
+
 /** Keyword pattern for relevance-path Engineering_Highlights (Req 7.9). */
 const HIGHLIGHT_RE = /feat|fix|refactor|add|implement|redesign/i;
 
@@ -1114,6 +1362,7 @@ export function selectHighlightCommits(
     const ordered = [...commits]
       .filter((c) => FEAT_COMMIT_RE.test(c.subject))
       .filter((c) => !DEPENDENCY_WORD_RE.test(c.subject))
+      .filter((c) => !isDocsCommit(c.subject))
       .sort((a, b) => (a.timestamp < b.timestamp ? 1 : a.timestamp > b.timestamp ? -1 : 0));
     for (const commit of ordered) {
       if (out.length >= SLIDE_CONFIG.maxFallbackHighlights) break;
@@ -1129,6 +1378,7 @@ export function selectHighlightCommits(
 
   const out: { commit: Commit; category: ChangeCategory; context: string | null }[] = [];
   for (const commit of commits) {
+    if (isDocsCommit(commit.subject)) continue;
     if (!HIGHLIGHT_RE.test(commit.subject)) continue;
     const category = categoryFromTitle(commit.subject);
     if (!category || category === "Bug Fix") continue;
@@ -1276,7 +1526,7 @@ export function buildEvolutionSlides(
 
   for (const release of milestoneReleases) {
     if (remaining <= 0) break;
-    const context = extractChangeContext(release.body);
+    const context = extractChangeContext(cleanReleaseNotes(release.body));
     if (!context || !isRelevant(`${releaseTitle(release)} ${context}`, anchors)) continue;
     slides.push(
       makeSlide(
