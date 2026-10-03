@@ -293,6 +293,52 @@ function sectionProse(lines: ScannedLine[]): string {
   return lines.filter(isProseLine).map(proseText).join(" ").trim();
 }
 
+/** EARS/requirement lead-ins and spec bookkeeping lines (B2a-2). */
+const REQUIREMENT_LINE_RE = /^(the system shall\b|when |if |while |requirement\s+\d+\s*:|user story\s*:)/i;
+
+/** Glossary definition line: a bold or backticked term immediately followed by a colon (B2a-2). */
+const GLOSSARY_LINE_RE = /^(\*\*[^*]+\*\*|`[^`]+`)\s*:/;
+
+/**
+ * Decide whether a line is Explanatory_Prose (B2a-2, Req 6.3): a prose line that
+ * is not an EARS/requirement statement, not a Glossary definition, and not a
+ * single-token label. Structural rules only; no numeric length threshold.
+ *
+ * @param l - A scanned line.
+ * @returns True when the line is eligible explanatory prose.
+ */
+function isExplanatoryProse(l: ScannedLine): boolean {
+  if (!isProseLine(l)) return false;
+  const raw = l.text.trim().replace(/^>\s?/, "");
+  if (REQUIREMENT_LINE_RE.test(raw) || GLOSSARY_LINE_RE.test(raw)) return false;
+  const plain = proseText(l);
+  // Reject single-token labels (fewer than two words); keep genuine sentences.
+  return /\S\s+\S/.test(plain);
+}
+
+/**
+ * Return the first run of consecutive Explanatory_Prose lines across the given
+ * documents, scanning each document's lines in order (B2a-2). Used only as the
+ * how-it-works fallback when preferred sections yield no prose.
+ *
+ * @param docs - Spec documents, already in `designFirst` order.
+ * @returns Joined plain text of the first eligible paragraph, or "".
+ */
+function specExplanatoryProse(docs: SpecDocument[]): string {
+  for (const doc of docs) {
+    const run: ScannedLine[] = [];
+    for (const l of scanLines(doc.content)) {
+      if (isExplanatoryProse(l)) {
+        run.push(l);
+      } else if (run.length > 0) {
+        break;
+      }
+    }
+    if (run.length > 0) return run.map(proseText).join(" ").trim();
+  }
+  return "";
+}
+
 /**
  * Return the first prose paragraph of a Markdown document.
  *
@@ -436,11 +482,59 @@ export function buildIntroSlide(
 /** README headings that introduce a capabilities section. "Usage" belongs to Run only. */
 const CAPABILITIES_HEADING_RE = /^(capabilities|what it does|what you can do|use cases)\b/i;
 
-/** A spec user story: `As a …, I want …, so that …`. */
-const USER_STORY_RE = /\bas an? [^,]+,\s*I want (?:to )?(.+?)(?:,?\s+so that\b.*)?$/i;
+/**
+ * A spec user story: `As a …, I want …, so that …`. Capture group 1 is the raw
+ * "I want" clause, including any leading `to`/`System_Subject`, so the
+ * Action_Phrase transform (B2a-1) and the selection key can be derived
+ * separately.
+ */
+const USER_STORY_RE = /\bas an? [^,]+,\s*I want (.+?)(?:,?\s+so that\b.*)?$/i;
+
+/**
+ * Grammatical subjects that denote the software itself in a user story's
+ * "I want <subject> to <action>" form (B2a-1, Req 5.13). Deliberately a
+ * conservative, evidence-based set; not extended by matching arbitrary noun
+ * phrases. Algorithm data, not a governed constant.
+ */
+const SYSTEM_SUBJECTS: readonly string[] = ["the system", "the video"];
+
+/**
+ * Reduce a user story's "I want" clause to its Action_Phrase (B2a-1, Req 5.13).
+ *
+ * Recognizes exactly two grammar shapes: a leading `to <action>`, or a leading
+ * {@link SYSTEM_SUBJECTS} subject followed by ` to <action>`. Any other clause
+ * (plain noun phrase, unrecognized subject before `to`, or no `to`) is returned
+ * unchanged. No rewording, synonym substitution, tense change, or generation.
+ *
+ * @param clause - The raw "I want" clause (text after "I want", before "so that").
+ * @returns The display Action_Phrase, capitalized with a trailing sentence mark removed.
+ */
+export function userStoryActionPhrase(clause: string): string {
+  const trimmed = clause.trim();
+  const lower = trimmed.toLowerCase();
+  let action = trimmed;
+  if (lower.startsWith("to ")) {
+    action = trimmed.slice(3);
+  } else {
+    for (const subject of SYSTEM_SUBJECTS) {
+      if (lower.startsWith(subject + " to ")) {
+        action = trimmed.slice(subject.length + 4);
+        break;
+      }
+    }
+  }
+  return capitalize(action.trim().replace(/[.,;]+$/, ""));
+}
 
 /**
  * Extract Capabilities: README capabilities section first, spec user stories second.
+ *
+ * The returned strings are the selection-stable Capability texts used for
+ * deduplication, the Capabilities-versus-Key_Feature overlap check (Req 5.5),
+ * and Anchor_Terms. For spec user stories, the leading `to` is removed exactly
+ * as before; the Action_Phrase display transform (B2a-1) is applied only when
+ * the slide is built, so improved wording never changes selection, order,
+ * overlap, or anchors.
  *
  * @param readmeText - Raw README, or null.
  * @param specDocs - Spec documents.
@@ -460,7 +554,7 @@ export function extractCapabilities(readmeText: string | null, specDocs: SpecDoc
         if (l.inFence) continue;
         const text = toPlainText(l.text).replace(/^User Story:\s*/i, "");
         const m = USER_STORY_RE.exec(text);
-        if (m) raw.push(capitalize(m[1]!.trim().replace(/[.,;]+$/, "")));
+        if (m) raw.push(capitalize(m[1]!.trim().replace(/^to\s+/i, "").replace(/[.,;]+$/, "")));
       }
     }
   }
@@ -480,11 +574,18 @@ export function extractCapabilities(readmeText: string | null, specDocs: SpecDoc
 /**
  * Build the Capabilities slide.
  *
+ * Applies the Action_Phrase display transform (B2a-1) to each Capability. The
+ * transform only strips a leading `to`/`System_Subject` prefix, so README-sourced
+ * Capabilities are unchanged and only spec-story wording improves. This is a
+ * display-only step: selection, order, dedup, overlap, and anchors were already
+ * decided from the untransformed text.
+ *
  * @param capabilities - Extracted Capabilities (non-empty).
  * @returns A `"capabilities"` {@link Slide}.
  */
 export function buildCapabilitiesSlide(capabilities: string[]): Slide {
-  return makeSlide("capabilities", "What you can do", capabilities.map((c) => `• ${c}`).join("\n"));
+  const display = capabilities.map((c) => userStoryActionPhrase(c));
+  return makeSlide("capabilities", "What you can do", display.map((c) => `• ${c}`).join("\n"));
 }
 
 /**
@@ -660,6 +761,16 @@ export function extractHowItWorks(readmeText: string | null, specDocs: SpecDocum
       }
     }
   }
+
+  // Fallback (B2a-2, Req 6.3): when no design/architecture/decision section
+  // supplied prose, use the first substantive Explanatory_Prose paragraph in
+  // designFirst/document order. Headings and anchors are left unchanged.
+  if (sentences.length === 0) {
+    for (const s of firstSentences(specExplanatoryProse(docs), SLIDE_CONFIG.specMaxSentences)) {
+      if (sentences.length < SLIDE_CONFIG.specMaxSentences) sentences.push(s);
+    }
+  }
+
   if (headings.length === 0 && sentences.length === 0) return null;
 
   const parts = [docTitle];
