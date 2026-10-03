@@ -943,3 +943,81 @@ Each mutation must make a behavioral test fail; a type/syntax error does not cou
 ## Test-hygiene backlog (tracked, not fixed in B2a)
 
 - **TH1. Renderer tests leave temp `.mp4` files.** `tests/*` exercising download/large-file paths write `download-test-job.mp4` and `large-file-job.mp4` into the OS tmpdir and do not remove them, so each full run leaves two stray files that are repeatedly rediscovered and cleaned by hand. Fix later by having those tests write to a per-test temp dir and clean up in `afterEach`/`afterAll`. Not addressed in B2a.
+
+---
+
+# Implementation Plan: Empty-Anchor Evolution Fallback (Cycle Q2)
+
+## Overview
+
+Reframed Q2 (from the real-repo review). For repositories with no Anchor_Terms, surface the independently-significant evolution evidence the pipeline already holds (Significant_PRs and non-patch Releases with a Change_Context), and show source-derived release context on the empty-anchor timeline. Anchored repositories stay byte-identical. Req 7.23–7.25; Properties 28–30 (and Property 10 amended). All changes in `src/server/storyboard.ts` plus tests.
+
+Out of scope: Q1 capability ordering, B2b `perf:`, Candidate C (F2/F3/F4), Candidate D, TH1. No analyzer, GitHub-request, `ChangeCategory`, ranking, cap, patch-classification, or Change_Group change.
+
+Branch `fix/empty-anchor-evolution` from `main`. Commit plan:
+1. `docs:` specs.
+2. `fix:` empty-anchor PR/release eligibility in `planEvolution` + deep-dive guard.
+3. `fix:` empty-anchor release context on the timeline.
+
+No push without approval.
+
+## Tasks
+
+- [ ] 43. Empty-anchor notable-change eligibility (Req 7.23, 7.24)
+  - [ ] 43.1 In `planEvolution`, compute `relevantPrs` as `anchors.size === 0 ? ranked : ranked.filter((r) => isRelevant(...))`. `deepDives` still excludes "Bug Fix" and slices to remaining slots. Timeline PR entries use the same `relevantPrs` as today.
+  - [ ] 43.2 In `buildEvolutionSlides`, change the release deep-dive guard to `context && (anchors.size === 0 || isRelevant(releaseTitle+context, anchors))`. Patch exclusion, ordering, `cleanReleaseNotes`, `extractChangeContext`, and the slot ceiling unchanged.
+  - [ ] 43.3 Leave `selectHighlightCommits` and the 7.14 `feat`-only fallback untouched; confirm Selected_PR Change_Group blocking still applies (7.15).
+
+- [ ] 44. Empty-anchor timeline release context (Req 7.25)
+  - [ ] 44.1 In the timeline builder, when `anchors.size === 0`, append the release's `extractChangeContext(cleanReleaseNotes(body))` (truncated to `changeContextMaxWords`) to its entry as `tag — context`; releases without context stay `tag` only. When anchors exist, the entry string is unchanged. PR timeline entries are unchanged.
+
+- [ ] 45. Validation
+  - [ ] 45.1 Update existing tests only where empty-anchor fixtures intentionally gain evolution content. Anchored fixtures must be unchanged.
+  - [ ] 45.2 Type-check (0 errors), full suite, build, governed-literal scan, `git diff --check`, traceability (Req 7: 1–25, Properties 1–30).
+  - [ ] 45.3 Regression: Properties 1–27 pass; slide ordering, caps (`maxEvolutionItems`, `maxEvolutionSlides`, 15-slide), category ranking, patch classification, and Change_Group behavior unchanged; analyzer request-count tests unchanged (no analyzer diff).
+  - [ ] 45.4 Mutation checks (below); each must fail a behavioral test.
+  - [ ] 45.5 Fixture before/after on the four existing fixtures plus the empty-anchor cases below, and the real `slugify` acceptance snapshot (from captured data, no new GitHub requests). Explain every difference.
+  - [ ] 45.6 Fill the verification table, clean temporary files, commit as planned.
+
+## Test Matrix
+
+| Case | Expectation |
+|---|---|
+| anchors empty + release with usable context | release deep-dive and/or timeline entry carries the source context |
+| anchors empty + release with empty/unusable body | release stays `tag` only; no deep-dive from empty context; no invented text |
+| anchors empty + Significant_PRs | PR deep-dives appear in rank order (non-"Bug Fix") |
+| anchors empty + both PR and release evidence | PR deep-dives first, releases fill remaining slots; caps respected |
+| anchors empty + no significant evidence | no notable-change slides; only the `feat`-fallback highlights, if any |
+| anchors present + identical inputs | byte-identical evolution slides (Property 29) |
+| patch releases | still excluded in the empty-anchor case |
+| maintenance/noise PRs (bot, chore/docs/ci, deps, uncategorized, Bug Fix) | still excluded when anchors empty |
+| caps | `maxEvolutionSlides`/`maxEvolutionItems`/15-slide still enforced |
+
+## Mutation Plan
+
+| Mutation | Expected failing test |
+|---|---|
+| `relevantPrs = ranked` always (ignore anchors) | anchored-invariance (Property 29) test |
+| empty-anchor branch admits "Bug Fix" PRs | empty-anchor PR category test |
+| empty-anchor branch admits bot/maintenance/deps PRs | empty-anchor noise-exclusion test |
+| release guard drops the `isRelevant` disjunct for anchored repos (always allow) | anchored-invariance test |
+| release guard ignores `context` (allow empty-context releases) | empty-body release test |
+| timeline context applied when anchors exist | anchored-invariance timeline-text test |
+| timeline/deep-dive context invented when `extractChangeContext` returns null | provenance (Property 30) test |
+| displayed context bypasses `cleanReleaseNotes` (shows raw body/URL/hash) | provenance (Property 30) test: URL/hash absent, link text kept |
+| empty-anchor branch makes commits eligible as highlights | highlight-unchanged test |
+
+## Real `slugify` acceptance (captured data, no new requests)
+
+Before: timeline shows bare `… · Release · v3.0.0`, no deep-dives (0 anchors suppressed everything).
+After (expected): empty-anchor timeline entries carry context, e.g. `v3.0.0 — Require Node.js 20`, `v2.2.0 — Add preserveCharacters option`, `v1.1.0 — Add support for empty separator`; and/or Significant_PR deep-dives such as "Add preserveTrailingDash option" appear in rank order, within `maxEvolutionSlides`. Releases without usable notes stay `tag` only. No new GitHub requests.
+
+Note on PR-vs-release duplication (Decision 2): slugify's PRs ("Add preserveTrailingDash option") and release notes ("Add preserveTrailingDash option") can describe the same change. Deep-dive allocation puts PRs first and releases fill remaining slots; Change_Group blocking (7.15) prevents PR-vs-commit duplication. PR-vs-release textual overlap is accepted as-is (as for anchored repos today); no PR-vs-release deduplication — not even exact-equality — is added. Observed duplication is reported, not fixed, this cycle.
+
+## Notes
+
+- No governed constants added. No numeric thresholds. The fallback is gated solely on `anchors.size === 0`.
+- Caps unchanged; the fallback only changes which already-significant evidence passes the (removed) relevance test, never the ceilings.
+- Fixtures are synthetic except the `slugify` acceptance snapshot, which uses already-captured data; this cycle makes no GitHub requests.
+
+**Scope guard:** if any change is needed outside `storyboard.ts`, or would touch `ChangeCategory`, ranking, caps, patch classification, Change_Groups, or request behavior, stop and report instead of expanding scope.
