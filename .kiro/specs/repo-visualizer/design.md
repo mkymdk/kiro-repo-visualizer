@@ -416,6 +416,32 @@ Observed `slugify` data: all non-patch releases have usable cleaned context (`v3
 
 *No new requests, no new constants:* all inputs (`releases`, `pullRequests`, `commits`) are already fetched; `changeContextMaxWords` is the existing governed cap. Expected production change: `storyboard.ts` only (`planEvolution`, the release loop and timeline builder in `buildEvolutionSlides`).
 
+#### PR deep-dive context sanitation (Req 7.26)
+
+*Problem (from the real-repo review):* PR deep-dive bodies pass through `extractChangeContext(pr.body)` without the URL/reference cleanup that release notes receive via `cleanReleaseNotes`. On anchor-less repos (which now surface PR deep-dives, Q2), this exposes structural GitHub metadata — slugify PR #46's body begins `Closes https://…/issues/37 …`.
+
+*Two representations (the regression boundary):* `RankedPullRequest.context = extractChangeContext(pr.body)` is computed once in `rankSignificantPullRequests` and is used **both** for relevance (`isRelevant(title + context, anchors)` in `planEvolution`) **and** for the deep-dive body. Sanitizing it in place would change relevance for anchored repos. So we add a **second** field used for display only:
+- `context` (unchanged): relevance, significance, ranking, category, timeline eligibility, Change_Group, allocation — all keep using it.
+- `displayContext = extractChangeContext(cleanPullRequestBody(pr.body))`: used only as the deep-dive body (the `change` slide for a PR).
+
+`displayContext` is computed in the same place as `context` so no call site changes selection. The deep-dive loop reads `r.displayContext` instead of `r.context`; nothing else changes.
+
+*`cleanPullRequestBody(body)` — structural only, no prose rewriting:* operates line by line over `scanLines` output (so fenced-code and HTML-comment handling matches `extractChangeContext`'s later pass), removing a line **only** when its sole meaningful content is structural metadata:
+- a URL-only line (`^<url>$` after trimming, including an autolink `<url>`);
+- an issue/PR-reference-only line (`^#\d+$`, `^owner/repo#\d+$`, `^GH-\d+$`, or a comma-separated list of these);
+- an issue-closing line: `^(close[sd]?|fix(e[sd])?|resolve[sd]?)\b` followed only by a URL and/or issue/PR references (this is the slugify #46 case; `extractChangeContext` already drops `Closes #NN` but not `Closes <URL>`);
+- a standalone commit-hash line, using the same conservative hash rule as `cleanReleaseLine` (7–40 hex with at least one digit and one `a–f` letter).
+
+Lines that are prose keep their URLs/references/hashes intact (so `See https://x for details` and `Fixes a bug introduced in #123.` are untouched). Markdown links keep their visible text through the existing `toPlainText` in `extractChangeContext`. The function does **not** reorder, score, or select sentences; after cleanup, `extractChangeContext` runs exactly as today (first sentence, truncation).
+
+*Why not `cleanReleaseNotes`:* it is section/bullet-oriented and, on PR prose, orphaned the `Closes` keyword and still kept the rambling sentence — strictly worse. PR bodies get their own narrow cleaner. Release cleaning is untouched; if substantial unavoidable duplication appears, stop and report before refactoring release code.
+
+*Clean-body invariance:* when `cleanPullRequestBody(body)` removes no targeted line, its output equals the input and `displayContext === context`, so the PR deep-dive slide is byte-identical to today. An anchored repo whose PR bodies are clean is therefore unchanged; an anchored repo with a genuinely noisy PR body gets the display fix while its relevance/selection (which use `context`) stay identical.
+
+*Out of scope (accepted limitations):* rambling / wrong-first-sentence selection (slugify #57) — no sentence scoring, no "prefer last/`Adds`/`This PR`", no semantic/LLM summary; raw Unicode emoji — preserved, only recognized `:shortcode:` emoji are stripped (B6a, in `makeSlide`); bare URLs embedded in prose — preserved.
+
+*No new requests, no new constants, `storyboard.ts` only:* `pr.body` is already fetched; the new field and helper live in `storyboard.ts`.
+
 #### Semantic/story quality (Cycle B2a, Req 5.4, 5.13, 6.3, 6.10)
 
 Two narrow fixes, both inside `storyboard.ts`. No analyzer, config, GitHub-request, classification, ordering, slide-cap, or Change_Group change.
@@ -960,6 +986,24 @@ In the empty-anchor case, any Change_Context shown for a Release — on its time
 - adding context does not change the set or order of timeline release entries.
 
 **Validates: Requirements 7.20, 7.25**
+
+### Property 31: PR Deep-Dive Context Is Structurally Sanitized
+
+The body of a PR notable-change slide is exactly `extractChangeContext(cleanPullRequestBody(pr.body))` (then existing display processing). It never contains a URL-only, reference-only, closing-reference (`Closes <URL>` / `Closes #NN`), or standalone-hash line that `cleanPullRequestBody` targets. A URL, reference, or hash embedded in ordinary prose is preserved, and Markdown link text survives. No prose is reordered, scored, or rewritten. When the cleanup yields no usable prose, the slide falls back to title and dates (Req 7.7).
+
+**Validates: Requirements 7.7, 7.26**
+
+### Property 32: PR Display Sanitation Does Not Change Selection
+
+For identical analyzer input, adding PR display sanitation leaves unchanged: the set and order of selected Significant_PRs, their categories, every `isRelevant` decision (anchored and empty-anchor), the Evolution_Timeline entries and text, PR deep-dive titles, the deep-dive slot allocation, and all Change_Groups. Relevance, ranking, and allocation use the unmodified `context`; only the deep-dive body (`displayContext`) may differ.
+
+**Validates: Requirements 7.5, 7.26**
+
+### Property 33: Clean PR Bodies Are Byte-Identical
+
+When `cleanPullRequestBody(pr.body)` removes no targeted structural line, `displayContext` equals `context` and the PR deep-dive slide is byte-identical to the pre-sanitation output. Anchored repositories whose PR bodies carry no targeted noise are therefore unchanged, and their relevance/selection is unchanged regardless.
+
+**Validates: Requirements 7.26**
 
 ---
 

@@ -31,6 +31,7 @@ import {
   categoryFromTitle,
   categorizePullRequest,
   rankSignificantPullRequests,
+  cleanPullRequestBody,
   isPatchRelease,
   parseSemanticVersionTag,
   cleanReleaseNotes,
@@ -120,6 +121,97 @@ function anchorsFor(result: RepoAnalysisResult): Set<string> {
     how?.headings ?? [],
   );
 }
+
+// ---------------------------------------------------------------------------
+// PR deep-dive context sanitation (Properties 31–33)
+// ---------------------------------------------------------------------------
+
+describe("PR deep-dive sanitation (Properties 31–33)", () => {
+  const emptyAnchor = (prs: ReturnType<typeof pr>[]): RepoAnalysisResult =>
+    makeResult({ repo: "lib", readmeText: "# lib\n\nA tiny library.", directoryTree: [{ path: "index.js", type: "blob", size: 10 }], specDocs: [], pullRequests: prs });
+  const prBody = (n: number, title: string, body: string) => pr(n, title, "2024-02-0" + (n % 9 || 1) + "T00:00:00Z", { body });
+  const deepDiveBody = (result: RepoAnalysisResult, prNum: number): string | undefined => {
+    const s = generateStoryboard(result).find((x) => x.type === "change" && decode(x.title).includes("(#" + prNum + ")"));
+    return s ? decode(s.body) : undefined;
+  };
+
+  it("Property 31: removes structural metadata lines, keeps prose and inline URLs/refs", () => {
+    // cleanPullRequestBody is the pure unit under test.
+    expect(cleanPullRequestBody("Closes https://x/y/issues/37\nAdds a parser option.")).toBe("Adds a parser option.");
+    expect(cleanPullRequestBody("Fixes #12\nStreams tokens for speed.")).toBe("Streams tokens for speed.");
+    expect(cleanPullRequestBody("Resolves https://x/y/pull/9\nImprove latency.")).toBe("Improve latency.");
+    expect(cleanPullRequestBody("https://x/y\nUseful prose here.")).toBe("Useful prose here.");
+    expect(cleanPullRequestBody("#123\nUseful prose here.")).toBe("Useful prose here.");
+    expect(cleanPullRequestBody("a1b2c3d\nUseful prose here.")).toBe("Useful prose here.");
+    // Inline URL / reference / hash in prose is preserved verbatim.
+    expect(cleanPullRequestBody("See https://example.com/docs for configuration details.")).toBe("See https://example.com/docs for configuration details.");
+    expect(cleanPullRequestBody("Fixes a bug introduced in #123.")).toBe("Fixes a bug introduced in #123.");
+    expect(cleanPullRequestBody("The sha256 digest changed.")).toBe("The sha256 digest changed.");
+    // Hex word that is all letters is not a hash (kept).
+    expect(cleanPullRequestBody("deadbeef\nkept.")).toContain("deadbeef");
+  });
+
+  it("Property 31: the deep-dive body is the cleaned extraction result; falls back to title/dates", () => {
+    const result = emptyAnchor([prBody(1, "feat: add parser option", "Closes https://x/y/issues/37\n\nAdds a parser option so inputs are preserved.")]);
+    const body = deepDiveBody(result, 1)!;
+    expect(body).toContain("Adds a parser option");
+    expect(body).not.toMatch(/https?:\/\/|Closes/);
+    // A PR whose body is only a closing line → no context → title+dates only.
+    const bare = emptyAnchor([prBody(2, "feat: wire it up", "Closes https://x/y/issues/1")]);
+    const bareBody = deepDiveBody(bare, 2)!;
+    expect(bareBody).toMatch(/^Merged /);
+  });
+
+  it("Property 32: display sanitation does not change selection, order, categories, or relevance", () => {
+    const prs = [
+      prBody(1, "feat: alpha", "Closes https://x/y/1\n\nAlpha feature."),
+      prBody(2, "feat: beta", "Beta feature, no noise."),
+      prBody(3, "fix: gamma", "Fixes #9\n\nGamma fix."),
+    ];
+    const ranked = rankSignificantPullRequests(prs);
+    // context (relevance) is unchanged by sanitation; displayContext is the cleaned one.
+    const alpha = ranked.find((r) => r.pr.number === 1)!;
+    expect(alpha.context).toMatch(/Closes/); // relevance context keeps the raw first sentence
+    expect(alpha.displayContext).not.toMatch(/Closes|https?:\/\//);
+    // Selection identity/order via the storyboard: order by category then newest.
+    const result = emptyAnchor(prs);
+    const changeTitles = generateStoryboard(result).filter((s) => s.type === "change").map((s) => decode(s.title));
+    // Feature category, newest merge first: #2 (02-02) before #1 (02-01); fix:gamma is Bug Fix → no deep dive.
+    expect(changeTitles).toEqual([
+      "Feature · feat: beta (#2)",
+      "Feature · feat: alpha (#1)",
+    ]);
+  });
+
+  it("Property 32: anchored relevance uses the raw context, not the sanitized display context", () => {
+    // A feature PR whose only anchor-matching token ("parser") lives on a URL-only
+    // line that cleanPullRequestBody removes. Relevance must use the raw context,
+    // so the PR stays selected; the displayed body no longer contains the URL.
+    const result = makeResult({
+      readmeText: "# app\n\n## Features\n- **Parser** — the parser core",
+      pullRequests: [prBody(1, "feat: wire it up", "https://example.com/parser-notes\n\nMiscellaneous tidy.")],
+    });
+    expect(anchorsFor(result).size).toBeGreaterThan(0);
+    const changes = generateStoryboard(result).filter((s) => s.type === "change").map((s) => decode(s.title));
+    expect(changes).toContain("Feature · feat: wire it up (#1)"); // relevant via raw context's URL token
+    const body = deepDiveBody(result, 1);
+    if (body) expect(body).not.toMatch(/https?:\/\//); // display body is sanitized
+  });
+
+  it("Property 33: a clean PR body yields a byte-identical deep-dive (displayContext === context)", () => {
+    const prs = [prBody(1, "feat: alpha", "Alpha feature with no structural noise at all.")];
+    const ranked = rankSignificantPullRequests(prs);
+    expect(ranked[0]!.displayContext).toBe(ranked[0]!.context);
+    expect(cleanPullRequestBody(prs[0]!.body)).toBe(prs[0]!.body);
+  });
+
+  it("preserves raw Unicode emoji and inline refs in the displayed body", () => {
+    const result = emptyAnchor([prBody(1, "feat: emoji", "Adds a thing 😢 that works, see #5 inline.")]);
+    const body = deepDiveBody(result, 1)!;
+    expect(body).toContain("😢");
+    expect(body).toContain("#5");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Empty-anchor evolution fallback (Cycle Q2: Properties 28–30)

@@ -1021,3 +1021,82 @@ Note on PR-vs-release duplication (Decision 2): slugify's PRs ("Add preserveTrai
 - Fixtures are synthetic except the `slugify` acceptance snapshot, which uses already-captured data; this cycle makes no GitHub requests.
 
 **Scope guard:** if any change is needed outside `storyboard.ts`, or would touch `ChangeCategory`, ranking, caps, patch classification, Change_Groups, or request behavior, stop and report instead of expanding scope.
+
+---
+
+# Implementation Plan: PR Deep-Dive Context Sanitation
+
+## Overview
+
+Narrowed real-output fix: PR deep-dive bodies pass through `extractChangeContext(pr.body)` without the URL/reference cleanup release notes get, so anchor-less repos (which now surface PR deep-dives, Q2) expose structural GitHub metadata (slugify #46 begins `Closes <URL> …`). Add a display-only PR cleaning path (`cleanPullRequestBody`) and a separate `displayContext`, keeping the relevance `context` unchanged. Req 7.26; Properties 31–33. `storyboard.ts` only.
+
+Out of scope: rambling/wrong-sentence selection (#57), raw Unicode emoji, bare URLs embedded in prose, release/commit cleaning, Q2 semantics, B2b, Q1, Candidate C/D, TH1. No analyzer/config/type/request change, no `ChangeCategory` change.
+
+Branch `fix/pr-deep-dive-sanitation` from `main`. Commit plan:
+1. `docs:` specs.
+2. `fix:` `cleanPullRequestBody` + `displayContext` + deep-dive body uses it.
+
+No push without approval.
+
+## Tasks
+
+- [ ] 46. PR display-context pipeline (Req 7.26)
+  - [ ] 46.1 Add `cleanPullRequestBody(body)`: remove URL-only lines, issue/PR-reference-only lines, issue-closing lines (`Close[sd]?|Fix(e[sd])?|Resolve[sd]?` + only URL/refs), and standalone commit-hash lines (reuse the conservative hash rule). Prose with embedded URLs/refs/hashes is preserved; no sentence selection.
+  - [ ] 46.2 Add `displayContext` to `RankedPullRequest`, computed as `extractChangeContext(cleanPullRequestBody(pr.body))` alongside `context` in `rankSignificantPullRequests`. Leave `context` and all its consumers unchanged.
+  - [ ] 46.3 In `buildEvolutionSlides`, the PR deep-dive body uses `r.displayContext` (falling back to title+dates when null, as today). Nothing else changes.
+
+- [ ] 47. Validation
+  - [ ] 47.1 Update existing tests only where a noisy PR body intentionally produces cleaner display context. Clean-body cases must be unchanged.
+  - [ ] 47.2 Type-check (0 errors), full suite, build, governed-literal scan, `git diff --check`, traceability (Req 7: 1–26, Properties 1–33).
+  - [ ] 47.3 Regression: Properties 1–30 pass; Significant_PR eligibility, `ChangeCategory`, ranking, anchored relevance, empty-anchor fallback, PR timeline entries, deep-dive titles, allocation/order, release, commit, Change_Group behavior, caps, and section/slide order unchanged; analyzer request-count tests unchanged (no analyzer diff).
+  - [ ] 47.4 Mutation checks (below); each killed by a behavioral property/test.
+  - [ ] 47.5 Fixture before/after on the four existing fixtures; selected-PR identity/order comparison; real/captured `slugify` acceptance.
+  - [ ] 47.6 Fill the verification table, clean temporary files, commit as planned.
+
+## Test Matrix
+
+| Case | Expectation |
+|---|---|
+| clean ordinary PR body | `displayContext === context`; slide byte-identical |
+| standalone `Closes <URL>` | closing line removed; body is the remaining prose (or title/dates) |
+| standalone `Fixes <URL>` / `Resolves <URL>` | closing line removed |
+| standalone `Closes #123` | removed (already by extract; still removed) |
+| URL-only line | removed |
+| Markdown link with useful text | visible text preserved |
+| meaningful inline URL in prose (`See https://x for details`) | preserved verbatim |
+| standalone commit hash line | removed |
+| checklist / template `- [ ]` lines | still excluded (unchanged) |
+| raw Unicode emoji `😢` in prose | preserved |
+| GitHub shortcode `:tada:` | stripped by B6a in makeSlide (unchanged) |
+| multi-sentence rambling (#57-like) | first-sentence behavior preserved (accepted limitation) |
+| anchored PR whose context feeds relevance | relevance decision unchanged (uses `context`) |
+| empty-anchor Significant_PR | selected and shown; body cleaned |
+| multiple PRs | selection set/order/allocation identical before/after |
+
+## Mutation Plan
+
+| Mutation | Killed by |
+|---|---|
+| `isRelevant` uses `displayContext` | selection-invariance (Property 32) test / anchored relevance test |
+| deep-dive body uses original `context` | PR sanitation (Property 31) `Closes <URL>` test |
+| `cleanPullRequestBody` fails to remove `Closes <URL>` | Property 31 `Closes <URL>` test |
+| remove bare URLs indiscriminately (incl. prose) | inline-URL-preserved test |
+| strip arbitrary Unicode emoji | emoji-preserved test |
+| alter PR ranking/allocation | selection-invariance (Property 32) test |
+| route PR bodies through `cleanReleaseNotes` | prose-preserved / orphaned-`Closes` test |
+| `cleanPullRequestBody` changes a clean body | clean-body invariance (Property 33) test |
+
+## Real `slugify` acceptance (captured data where possible, no new requests)
+
+PR #46 before: body begins `Closes https://github.com/sindresorhus/slugify/issues/37 That's actually what I already made … 😢 …`.
+PR #46 after (expected): the `Closes <URL>` line is removed; the body is `extractChangeContext` of the remaining prose (`That's actually what I already made …`), which stays imperfect — accepted (no rewriting). Removed element: the closing-reference line.
+PR #57 before/after: unchanged — its noise is a rambling first sentence, not structural; wrong-first-sentence limitation remains (accepted).
+Selected PR identities/order must stay: `Add preserveTrailingDash option (#57)`, `Add support for empty separator (#53)`, `Add counter for multiple occurrences (#46)`. If live data shifted, use captured input for the invariance proof and state so.
+
+## Notes
+
+- No governed constants, no numeric thresholds. `cleanPullRequestBody` reuses the existing conservative hash rule and `scanLines`.
+- Dedicated `cleanPullRequestBody`; release cleaning untouched. If unavoidable duplication makes a shared helper clearly safer, stop and report before refactoring release code.
+- Fixtures are synthetic except the `slugify` acceptance, which uses captured data; no new GitHub requests.
+
+**Scope guard:** if any change is needed outside `storyboard.ts`, or would touch `ChangeCategory`, release cleaning, Q2 semantics, ranking, caps, Change_Groups, or request behavior, stop and report.
