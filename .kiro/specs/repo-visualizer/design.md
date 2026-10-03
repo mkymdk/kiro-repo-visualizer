@@ -183,7 +183,7 @@ Shared helpers:
 
 Anchor terms come only from current-state content. Commits, PRs, and releases never contribute anchors or current-state slide content (Req 3.13).
 
-**Empty anchor set (thin or commit-only repositories, Req 7.14):** When the README and specs yield no capability, feature, or how-it-works terms, no PR or release can be relevant, so there are no relevant PR timeline entries and no deep dives. Non-patch releases can still appear on the timeline, since they don't need relevance. The relevance-based commit path (7.9) is replaced by a narrow fallback: only commits whose subject starts with a conventional `feat` type (`feat:`, `feat(scope):`, `feat!:`, `feat(scope)!:`) qualify, minus dependency wording and already-presented PR references, capped at `maxFallbackHighlights`. Keyword substring matches (`add`, `implement`, …), `fix`, `docs`, `chore`, and every other type are excluded. The fallback shows that the repository evolved; it never feeds Capabilities, Key_Features, or anchors.
+**Empty anchor set (thin or commit-only repositories, Req 7.14, 7.23–7.25):** When the README and specs yield no capability, feature, or how-it-works terms, the Anchor_Term relevance test cannot be satisfied. Rather than discard already-fetched, independently-significant evidence, the **Empty_Anchor_Evolution_Fallback** (Q2) applies for notable-change slides: Significant_PRs (non-"Bug Fix", already filtered by Req 7.1) and non-patch Releases with a Change_Context become eligible, ranked and allocated exactly as Req 7.3/7.5/7.6 define. The commit path is unchanged: the narrow `feat`-only Engineering_Highlight fallback (7.14) still applies, with no PR/release relevance borrowed into it. Non-patch releases still appear on the timeline as before, and in the empty-anchor case a release entry additionally shows its cleaned Change_Context (7.25). The fallback never feeds Capabilities, Key_Features, or anchors, and it never changes behavior when anchors exist. See "Empty-anchor evolution (Q2)" below.
 
 #### Stage 3: Evolution candidates
 
@@ -388,6 +388,33 @@ Six narrow fixes, all inside `storyboard.ts`. Each policy is its own small pure 
 - B1: a calendar-style tag with no leading zeros that otherwise satisfies the tag shape (for example `2024.1.15`) is classified as a semantic version, and as a patch when its third component is above 0.
 - B5: a standalone numeric token in the configured year range (1900–2099), such as `2048` or `2049`, is treated as calendar noise even when it is a meaningful technical value. Numbers outside that range and mixed alphanumeric terms (`es2022`, `http2`, `1080p`) stay eligible. No generic numeric classification is introduced.
 - B6b: deduplication is deterministic normalized equality only. Two sentences that differ by meaningful words are both kept, so `chalk is a styling library` is not collapsed into a bare `A styling library` description. This false-negative bias is intentional.
+
+#### Empty-anchor evolution (Q2, Req 7.23–7.25)
+
+*Problem (from the real-repo review):* for a repository with **no Anchor_Terms** (no README capabilities/features/how-it-works, no specs — common for small libraries like `slugify`), `planEvolution`/`buildEvolutionSlides` discard evidence they already hold. The pipeline computes everything correctly, then the Anchor_Term relevance test rejects it:
+- `relevantPrs = ranked.filter((r) => isRelevant(…, anchors))` → with empty `anchors`, `isRelevant` returns false for every PR (its first line is `if (anchors.size === 0) return false`), so all Significant_PRs are dropped;
+- the release deep-dive loop requires `isRelevant(title+context, anchors)` → every release is skipped;
+- the timeline shows releases as `date · Release · tag` with no body, so `slugify` reads as bare `Release · vX` lines.
+
+Observed `slugify` data: all non-patch releases have usable cleaned context (`v3.0.0` → "Require Node.js 20", `v2.2.0` → "Add preserveCharacters option", `v1.1.0` → "Add support for empty separator"), and 16 PRs rank as Significant — all currently suppressed.
+
+*Why not `anchors.size === 0 ⇒ isRelevant true`:* `isRelevant` is also used to build `relevantPrs` for the **timeline** and could be reused elsewhere; flipping it globally would admit arbitrary evidence and couple unrelated consumers. The fallback is local to evolution planning only.
+
+*Design:* introduce the eligibility explicitly in `planEvolution`, keyed on `anchors.size === 0`:
+- `relevantPrs` becomes: if anchors exist, `ranked.filter(isRelevant)` (unchanged); else `ranked` as-is (already filtered by `rankSignificantPullRequests`: not bot, not `MAINTENANCE_TYPE_RE` i.e. `chore|docs|ci|style|test|build`, not `DEPENDENCY_WORD_RE`, and has a non-null Change_Category). `deepDives` still drops "Bug Fix" and still slices to the remaining-slot count — unchanged downstream.
+- the release deep-dive loop's guard becomes `context && (anchors.size === 0 || isRelevant(title+context, anchors))`. Patch exclusion, newest-first ordering, `cleanReleaseNotes`, `extractChangeContext`, and the slot ceiling are untouched.
+- the timeline builder, in the empty-anchor case only, appends the release's cleaned Change_Context to its entry text: `tag — <context>` (truncated to `changeContextMaxWords`), computed from the already-available `release.body`. Releases without context stay `tag` only. When anchors exist, the timeline string is byte-identical to today.
+- the commit path (`selectHighlightCommits`) is **not touched**: the `feat`-only empty-anchor fallback (7.14) is unchanged, and Selected_PRs still block their Change_Group members (7.15), so a PR deep-dive and a commit highlight can't duplicate the same change.
+
+*Anchored-repository invariance:* every change is inside an `anchors.size === 0` branch (or an `|| anchors.size === 0` disjunct that is false when anchors exist). For `anchors.size > 0`, `relevantPrs`, the deep-dive guard, the timeline string, highlight selection, allocation, caps, and Change_Groups are evaluated by the identical expressions as before. This is asserted as Property 29, not just observed on a fixture.
+
+*PR-vs-release duplication:* handled by existing structure — PR deep dives are allocated first, releases fill remaining slots, and Change_Group membership (7.15) prevents a Selected_PR's commits from also becoming highlights. **No PR-vs-release deduplication is added, not even exact-equality:** a PR and a release are structurally different evidence, and equal display text is not proof of the same Change_Group. A release and a PR describing the same change may both appear (as they can today for anchored repos). If real output later shows harmful duplication, it is recorded as a separate quality issue.
+
+*Timeline context presentation (Decision 3):* implemented locally by changing only the release timeline entry's **title string** produced inside `storyboard.ts` (the `TimelineEntry.title` becomes `tag — context` in the empty-anchor case). The shared `TimelineEntry`/`Slide` types are **not** expanded with a separate context field. If a type or any other production file turns out to be required, stop and report before expanding scope.
+
+*Context provenance (Property 30):* the displayed release context is exactly `extractChangeContext(cleanReleaseNotes(release.body))` truncated to `changeContextMaxWords`. It is not required to be a literal substring of the raw body, since that pipeline intentionally transforms source text (links reduce to link text; URLs/references/hashes are removed). No context is generated or rewritten outside that pipeline.
+
+*No new requests, no new constants:* all inputs (`releases`, `pullRequests`, `commits`) are already fetched; `changeContextMaxWords` is the existing governed cap. Expected production change: `storyboard.ts` only (`planEvolution`, the release loop and timeline builder in `buildEvolutionSlides`).
 
 #### Semantic/story quality (Cycle B2a, Req 5.4, 5.13, 6.3, 6.10)
 
@@ -783,9 +810,9 @@ Feature slides never exceed `maxFeatureSlides`, evolution slides never exceed `m
 
 ### Property 10: Evolution Is Anchored to the Current Repository
 
-When the anchor set is non-empty, every notable-change and engineering-highlight slide refers to an item whose title or Change_Context matches at least one Anchor_Term, and none has Change_Category "Bug Fix". When the anchor set is empty, there are no notable-change slides, and engineering-highlight slides are limited to `feat`-typed commits (no dependency wording), at most `maxFallbackHighlights` of them.
+When the anchor set is non-empty, every notable-change and engineering-highlight slide refers to an item whose title or Change_Context matches at least one Anchor_Term, and none has Change_Category "Bug Fix". When the anchor set is empty, notable-change slides are produced only through the Empty_Anchor_Evolution_Fallback (Property 28) — Significant_PRs (non-"Bug Fix") and non-patch Releases with a Change_Context — and engineering-highlight slides remain limited to `feat`-typed commits (no dependency wording), at most `maxFallbackHighlights` of them.
 
-**Validates: Requirements 7.5, 7.6, 7.9, 7.13, 7.14**
+**Validates: Requirements 7.5, 7.6, 7.9, 7.13, 7.14, 7.23**
 
 ### Property 11: Extracted Text Is Escaped for Every Slide Type
 
@@ -906,6 +933,33 @@ For the spec-based how-it-works fallback:
 - the heading list and the derived Anchor_Terms are byte-identical to the pre-B2a behavior.
 
 **Validates: Requirements 6.2, 6.3, 6.10**
+
+### Property 28: Empty-Anchor Evolution Uses Independently-Significant Evidence
+
+When the anchor set is empty:
+- a Significant_PR whose Change_Category is not "Bug Fix" is eligible for a notable-change slide, and a non-patch Release with a Change_Context is eligible, in the same rank order and under the same `maxEvolutionSlides`/`maxEvolutionItems` ceilings as the anchored path;
+- no evidence that fails an existing significance/quality filter becomes eligible: bot PRs, `chore|docs|ci|style|test|build` PRs, dependency-bump PRs, uncategorized PRs, "Bug Fix" PRs, patch releases, and releases without a Change_Context are all still excluded;
+- no commit becomes an Engineering_Highlight except through the unchanged `feat`-only rule (Property 10); Selected_PRs still block their Change_Group commits (no PR/commit duplication of one change).
+
+**Validates: Requirements 7.23**
+
+### Property 29: Anchored Repositories Are Unaffected by the Fallback
+
+For any analysis whose anchor set is non-empty, the set, order, categories, Change_Contexts, and rendered text of all evolution slides (timeline, notable-change, and highlight), the deep-dive allocation, and the Change_Groups are identical with and without the Empty_Anchor_Evolution_Fallback present. The fallback is reachable only when `anchors.size === 0`.
+
+**Validates: Requirements 7.24**
+
+### Property 30: Empty-Anchor Release Context Comes From the Approved Extraction Pipeline
+
+In the empty-anchor case, any Change_Context shown for a Release — on its timeline entry or on a release deep-dive — is **exactly** the result of the deterministic pipeline `release.body → cleanReleaseNotes → extractChangeContext`, truncated to `changeContextMaxWords`. The displayed context is not required to be a literal substring of the raw body, because that pipeline intentionally transforms source text (Markdown links reduce to their visible link text; URLs, references, and commit hashes are removed). No context is generated, inferred, or separately rewritten. Specifically:
+- Markdown link syntax may disappear while the visible link text survives;
+- URLs, `(#NN)` references, and commit hashes removed by `cleanReleaseNotes` never reappear in the displayed context;
+- the displayed context equals the extraction-pipeline result for the same body;
+- empty or unusable release notes produce no context (tag-only entry, no deep-dive);
+- patch releases remain excluded;
+- adding context does not change the set or order of timeline release entries.
+
+**Validates: Requirements 7.20, 7.25**
 
 ---
 
