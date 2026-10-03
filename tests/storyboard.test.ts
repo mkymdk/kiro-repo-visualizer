@@ -1082,9 +1082,42 @@ describe("categorization", () => {
     expect(categorizePullRequest(pr(1, "refactor(core)!: x", "t"))).toBe("Breaking Change");
     expect(categorizePullRequest(pr(1, "fix: add guard", "t"))).toBe("Bug Fix");
     expect(categorizePullRequest(pr(1, "Refactor then add cache", "t"))).toBe("Refactor");
-    expect(categorizePullRequest(pr(1, "perf: add cache", "t"))).toBe("Feature");
+    expect(categorizePullRequest(pr(1, "perf: add cache", "t"))).toBe("Refactor"); // perf → Refactor (B2b), not keyword "add"
     expect(categorizePullRequest(pr(1, "Tidy up", "t"))).toBeNull();
     expect(categoryFromTitle("Implement login")).toBe("Feature");
+  });
+
+  it("Property 34: perf → Refactor; perf! → Breaking; unknown type! not promoted; perf label & highlight", () => {
+    // perf conventional type → Refactor
+    expect(categoryFromTitle("perf: improve parser throughput")).toBe("Refactor");
+    expect(categoryFromTitle("perf(core): reduce allocations")).toBe("Refactor");
+    // perf with breaking marker → Breaking Change (recognized type + !)
+    expect(categoryFromTitle("perf!: drop slow path")).toBe("Breaking Change");
+    expect(categoryFromTitle("perf(core)!: drop slow path")).toBe("Breaking Change");
+    // recognized types with ! stay Breaking
+    expect(categoryFromTitle("feat!: x")).toBe("Breaking Change");
+    expect(categoryFromTitle("refactor(core)!: x")).toBe("Breaking Change");
+    // unknown type + ! is NOT promoted to Breaking by the bang alone
+    expect(categoryFromTitle("wibble!: something")).toBeNull();
+    expect(categoryFromTitle("chore!: tidy")).toBeNull();
+    // labels
+    expect(categorizePullRequest(pr(1, "Speed up rendering", "t", { labels: ["performance"] }))).toBe("Refactor");
+    expect(categorizePullRequest(pr(1, "Speed up rendering", "t", { labels: ["perf"] }))).toBe("Refactor");
+    // existing categories unchanged
+    expect(categoryFromTitle("feat: x")).toBe("Feature");
+    expect(categoryFromTitle("fix: x")).toBe("Bug Fix");
+    expect(categoryFromTitle("refactor: x")).toBe("Refactor");
+  });
+
+  it("Property 34: a conventional perf commit is eligible as an Engineering_Highlight", () => {
+    const result = makeResult({
+      readmeText: "# app\n\n## Features\n- **Parser** — the parser core",
+      commits: [commit("perf: speed up the parser core", "2024-05-01T00:00:00Z", "Reduces parser allocations.", "p1")],
+    });
+    const anchors = anchorsFor(result);
+    const picks = selectHighlightCommits(result.commits, anchors, buildChangeGroups(result.commits, []), new Set());
+    expect(picks.map((p) => p.commit.sha)).toContain("p1");
+    expect(picks.find((p) => p.commit.sha === "p1")!.category).toBe("Refactor");
   });
 
   it("excludes bots, maintenance types, dependency wording, and uncategorizable PRs", () => {
