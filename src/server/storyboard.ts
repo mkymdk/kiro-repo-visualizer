@@ -1532,15 +1532,25 @@ interface EvolutionPlan {
  * @returns The {@link EvolutionPlan}.
  */
 function planEvolution(result: RepoAnalysisResult, anchors: ReadonlySet<string>): EvolutionPlan {
+  // Empty_Anchor_Evolution_Fallback (Req 7.23, 7.24): when no Anchor_Term exists,
+  // the relevance test is unsatisfiable, so use the already-filtered Significant_PRs
+  // directly. All upstream significance gates (bot, maintenance type, dependency,
+  // category) and ranking are preserved by rankSignificantPullRequests. When
+  // anchors exist, behavior is identical to before.
+  const emptyAnchors = anchors.size === 0;
   const ranked = rankSignificantPullRequests(result.pullRequests);
-  const relevantPrs = ranked.filter((r) => isRelevant(`${r.pr.title} ${r.context ?? ""}`, anchors));
+  const relevantPrs = emptyAnchors
+    ? ranked
+    : ranked.filter((r) => isRelevant(`${r.pr.title} ${r.context ?? ""}`, anchors));
   const milestoneReleases = result.releases
     .filter((r) => !isPatchRelease(r))
     .sort((a, b) => (a.publishedAt < b.publishedAt ? 1 : a.publishedAt > b.publishedAt ? -1 : 0));
 
   // Timeline: newest milestone releases first, then top relevant PRs; shown oldest → newest.
+  // In the empty-anchor case only, a release entry carries its source-derived
+  // Change_Context as "tag — context" (Req 7.25); anchored timelines are unchanged.
   const entries: TimelineEntry[] = [
-    ...milestoneReleases.map((r): TimelineEntry => ({ date: r.publishedAt, label: "Release", title: releaseTitle(r) })),
+    ...milestoneReleases.map((r): TimelineEntry => ({ date: r.publishedAt, label: "Release", title: timelineReleaseTitle(r, emptyAnchors) })),
     ...relevantPrs.map((r): TimelineEntry => ({ date: r.pr.mergedAt, label: r.category, title: r.pr.title })),
   ]
     .slice(0, SLIDE_CONFIG.maxEvolutionItems)
@@ -1550,6 +1560,23 @@ function planEvolution(result: RepoAnalysisResult, anchors: ReadonlySet<string>)
   const slots = SLIDE_CONFIG.maxEvolutionSlides - (timeline.length > 0 ? 1 : 0);
   const deepDives = relevantPrs.filter((x) => x.category !== "Bug Fix").slice(0, Math.max(0, slots));
   return { timeline, deepDives, milestoneReleases };
+}
+
+/**
+ * Timeline title for a release. In the empty-anchor case, appends the
+ * source-derived Change_Context as `tag — context` when the existing
+ * `cleanReleaseNotes`/`extractChangeContext` pipeline yields one (Req 7.25);
+ * otherwise, and whenever anchors exist, returns the plain release title.
+ *
+ * @param release - A non-patch release.
+ * @param emptyAnchors - True when no Anchor_Term exists.
+ * @returns The timeline entry title.
+ */
+function timelineReleaseTitle(release: Release, emptyAnchors: boolean): string {
+  const title = releaseTitle(release);
+  if (!emptyAnchors) return title;
+  const context = extractChangeContext(cleanReleaseNotes(release.body));
+  return context ? `${title} — ${context}` : title;
 }
 
 /** Anchor_Terms exactly as {@link generateStoryboard} derives them (current-state content only). */
@@ -1638,7 +1665,9 @@ export function buildEvolutionSlides(
   for (const release of milestoneReleases) {
     if (remaining <= 0) break;
     const context = extractChangeContext(cleanReleaseNotes(release.body));
-    if (!context || !isRelevant(`${releaseTitle(release)} ${context}`, anchors)) continue;
+    // Empty_Anchor_Evolution_Fallback (Req 7.23): with no anchors, a non-patch
+    // release with a Change_Context is eligible; the relevance test is skipped.
+    if (!context || !(anchors.size === 0 || isRelevant(`${releaseTitle(release)} ${context}`, anchors))) continue;
     slides.push(
       makeSlide(
         "change",
