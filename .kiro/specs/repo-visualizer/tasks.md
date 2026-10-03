@@ -852,3 +852,94 @@ Each mutation must make a behavioral test fail; a type or syntax error doesn't c
 - B6b: deterministic normalized equality only, so `chalk is a styling library` and a bare `A styling library` description are both kept.
 
 **Scope guard:** if implementation shows any change is needed outside `storyboard.ts`, or would need an analyzer change, a new GitHub request, a governed constant, or a new dependency, stop and report instead of expanding scope.
+
+---
+
+# Implementation Plan: Semantic/Story Quality (Cycle B2a)
+
+## Overview
+
+Two deterministic text-quality fixes from deferred live-validation items 6 and 7 (Req 5.4, 5.13, 6.3, 6.10; Properties 26, 27). Both are confined to `src/server/storyboard.ts` plus tests. No analyzer, pipeline, route, config, or GitHub-request changes; no change to evolution classification, `ChangeCategory`, `perf:` handling, slide ordering, slide caps, duration, or Change_Group behavior.
+
+Out of scope: B2b (`perf:` category), capability source selection or dedup semantics, how-it-works slide structure/ordering, Candidates C and D, and any generative/LLM/NLP text.
+
+Branch `fix/story-quality` from `main`. Commit plan:
+1. `docs:` specs.
+2. `fix:` capability phrasing (B2a-1).
+3. `fix:` spec how-it-works prose fallback (B2a-2).
+
+No push without approval.
+
+## Tasks
+
+- [ ] 40. Capability phrasing (B2a-1, Req 5.13)
+  - [ ] 40.1 Add `SYSTEM_SUBJECTS` (two members: `the system`, `the video`) and `userStoryActionPhrase(clause)`; apply it to the spec-story branch of `extractCapabilities` for display text, preserving the raw clause for dedup/overlap so selection is unchanged.
+  - [ ] 40.2 Prove selection invariance: dedup keys and `capabilitiesOverlapFeatures` input produce the same surviving items and order as before; if the Action_Phrase cannot be shown selection-safe for dedup, key dedup on the raw clause.
+  - [ ] 40.3 Tests: the transform table and the preserve table below; the kiro fixture capabilities now read action-first; overlap/selection unchanged on all fixtures.
+
+- [ ] 41. Spec how-it-works prose fallback (B2a-2, Req 6.3, 6.10)
+  - [ ] 41.1 Add `isExplanatoryProse(line)` (structural rules only, no character threshold) and `specExplanatoryProse(docs)`; wire into `extractHowItWorks` only when the preferred paths yield no sentences. Headings and `HowItWorks.headings` are untouched.
+  - [ ] 41.2 Tests: a spec with prose only under "Overview"/"Components" now yields prose; a design/architecture section still wins when present; a headings-only spec stays headings-only; requirement lines, glossary lines, tables, code, and short fragments are rejected; anchors unchanged.
+
+- [ ] 42. Validation
+  - [ ] 42.1 Update existing tests only where output intentionally improves (the kiro capability strings; any how-it-works fixture that gains prose). Property 8 corpus check still holds.
+  - [ ] 42.2 Type-check (0 errors), full suite, build, governed-literal scan, `git diff --check`, traceability (Req 5: 1–12, Req 6: 1–10, Properties 1–27).
+  - [ ] 42.3 Regression: Properties 1–25 pass; slide ordering, caps, duration, Change_Group, evolution classification, and `ChangeCategory` unchanged; analyzer request-count tests unchanged (no analyzer diff).
+  - [ ] 42.4 Mutation checks (below); each must fail a behavioral test.
+  - [ ] 42.5 Fixture before/after on the four existing fixtures plus a seeded spec-only fixture; explain every difference; zero GitHub requests.
+  - [ ] 42.6 Fill the verification table, clean temporary files, commit as planned.
+
+## Test Matrix
+
+**B2a-1 transform (display becomes the action phrase):**
+| Clause after "I want" | Action_Phrase |
+|---|---|
+| `to submit a GitHub repository URL` | `Submit a GitHub repository URL` |
+| `the System to automatically analyze a repository` | `Automatically analyze a repository` |
+| `the video to explain how the repository works` | `Explain how the repository works` |
+| `the application to export CSV files` | `Export CSV files` |
+
+**B2a-1 preserve (unchanged, catches over-stripping):**
+| Clause after "I want" | Kept as |
+|---|---|
+| `files to sync automatically` | `Files to sync automatically` |
+| `a fast parser` | `A fast parser` |
+| `the parser to be fast` (unrecognized subject `the parser`) | `The parser to be fast` |
+| `my data exported` | `My data exported` |
+
+**B2a-2 how-it-works:**
+| Spec shape | Result |
+|---|---|
+| prose under `## Design` | prose from the design section (unchanged path) |
+| prose only under `## Overview` / `## Components` | prose from the first substantive section (new fallback) |
+| headings only, no prose | headings-only body (deterministic) |
+| title + requirement lines + glossary + table only | headings-only (prose rejected) |
+| no headings, no prose | `extractHowItWorks` returns null |
+
+## Mutation Plan
+
+Each mutation must make a behavioral test fail; a type/syntax error does not count.
+
+| Item | Mutation | Expected failing test |
+|---|---|---|
+| B2a-1 | Return the clause unchanged (no transform) | the transform table |
+| B2a-1 | Strip any noun phrase before ` to ` (drop the closed-set check) | `files to sync automatically` / `the parser to be fast` / `the application to export CSV files` preserved |
+| B2a-1 | Change the dedup/overlap input to the Action_Phrase when it changes selection | overlap/selection-unchanged test |
+| B2a-2 | Remove the prose fallback | prose-only-under-Overview case |
+| B2a-2 | Fallback takes the first paragraph without `isExplanatoryProse` | requirement/glossary/table-rejected case |
+| B2a-2 | Drop the single-token-label check (accept one-word lines) | one-word-label-rejected case |
+| B2a-2 | Drop the EARS/requirement-line check | requirement-line-rejected case |
+| B2a-2 | Drop the Glossary-definition check | glossary-line-rejected case |
+| B2a-2 | Let the fallback alter `HowItWorks.headings` | anchors-unchanged test |
+
+## Notes
+
+- No governed constants and no numeric thresholds are added. `SYSTEM_SUBJECTS` (two members) is algorithm data in `storyboard.ts`, like `GENERIC_TERMS` and `CALENDAR_TERMS`. The earlier `HOW_IT_WORKS_MIN_PROSE_CHARS` idea is removed; Explanatory_Prose is identified by structural rules alone.
+- Caps and ordering are unaffected: both fixes only change the text inside existing slides.
+- Fixtures are synthetic; this cycle makes no GitHub requests.
+
+**Scope guard:** if any change is needed outside `storyboard.ts` (for example touching `ChangeCategory`, the analyzer, or `output.ts`), stop and report instead of expanding scope.
+
+## Test-hygiene backlog (tracked, not fixed in B2a)
+
+- **TH1. Renderer tests leave temp `.mp4` files.** `tests/*` exercising download/large-file paths write `download-test-job.mp4` and `large-file-job.mp4` into the OS tmpdir and do not remove them, so each full run leaves two stray files that are repeatedly rediscovered and cleaned by hand. Fix later by having those tests write to a per-test temp dir and clean up in `afterEach`/`afterAll`. Not addressed in B2a.
