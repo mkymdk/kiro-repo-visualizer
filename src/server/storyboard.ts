@@ -1071,6 +1071,61 @@ export function extractChangeContext(text: string): string | null {
   return sentence ? truncateToWords(sentence, SLIDE_CONFIG.changeContextMaxWords) : null;
 }
 
+/** A line that is only a URL (optionally an autolink `<url>`). */
+const URL_ONLY_RE = /^<?https?:\/\/\S+>?$/i;
+
+/** A single issue/PR reference token: `#12`, `owner/repo#12`, or `GH-12`. */
+const REFERENCE_TOKEN = "(?:[A-Za-z0-9_.\\/-]*#\\d+|GH-\\d+)";
+
+/** A line that is only one or more issue/PR references (comma/space separated). */
+const REFERENCE_ONLY_RE = new RegExp(`^${REFERENCE_TOKEN}(?:[\\s,]+${REFERENCE_TOKEN})*$`);
+
+/** An issue-closing line: a close/fix/resolve keyword followed only by URLs and/or references. */
+const CLOSING_REFERENCE_RE = new RegExp(
+  `^(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b[:\\s]*` +
+    `(?:https?:\\/\\/\\S+|<https?:\\/\\/[^>\\s]+>|${REFERENCE_TOKEN})` +
+    `(?:[\\s,]+(?:https?:\\/\\/\\S+|<https?:\\/\\/[^>\\s]+>|${REFERENCE_TOKEN}))*\\.?$`,
+  "i",
+);
+
+/** A line that is only a standalone commit hash (7–40 hex with a digit and an a–f letter). */
+const HASH_ONLY_RE = /^(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,40}$/;
+
+/**
+ * Remove structural GitHub metadata lines from a Pull_Request body before
+ * Change_Context extraction (B PR-sanitation, Req 7.26). Display-only: this is
+ * never applied to the relevance Change_Context.
+ *
+ * Removes a line only when its sole meaningful content is a URL, an issue/PR
+ * reference, an issue-closing clause (`Closes <URL>` / `Fixes #NN`), or a
+ * standalone commit hash. Prose that embeds a URL, reference, or hash is left
+ * untouched, and no sentence is reordered, scored, or rewritten.
+ *
+ * @param body - Raw Pull_Request body.
+ * @returns The body with structural-metadata lines removed; other lines verbatim.
+ */
+export function cleanPullRequestBody(body: string): string {
+  const out: string[] = [];
+  for (const l of scanLines(body)) {
+    if (l.inFence || l.headingLevel !== null) {
+      out.push(l.text);
+      continue;
+    }
+    const plain = toPlainText(l.text.trim().replace(/^>\s?/, ""));
+    if (
+      plain !== "" &&
+      (URL_ONLY_RE.test(plain) ||
+        REFERENCE_ONLY_RE.test(plain) ||
+        CLOSING_REFERENCE_RE.test(plain) ||
+        HASH_ONLY_RE.test(plain))
+    ) {
+      continue; // drop the structural-metadata line
+    }
+    out.push(l.text);
+  }
+  return out.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Act 6 — How has it evolved? (classification)
 // ---------------------------------------------------------------------------
@@ -1147,8 +1202,14 @@ export interface RankedPullRequest {
   pr: PullRequest;
   /** Assigned Change_Category. */
   category: ChangeCategory;
-  /** Change_Context of the body, or null. */
+  /** Change_Context of the body, or null. Used for relevance, ranking, timeline — never display. */
   context: string | null;
+  /**
+   * PR_Display_Context: Change_Context after PR-specific structural cleanup
+   * ({@link cleanPullRequestBody}), used only for the deep-dive slide body
+   * (Req 7.26). Equals {@link RankedPullRequest.context} for clean bodies.
+   */
+  displayContext: string | null;
 }
 
 /**
@@ -1163,7 +1224,12 @@ export function rankSignificantPullRequests(pullRequests: PullRequest[]): Ranked
     if (pr.isBot || MAINTENANCE_TYPE_RE.test(pr.title) || DEPENDENCY_WORD_RE.test(pr.title)) continue;
     const category = categorizePullRequest(pr);
     if (!category) continue;
-    ranked.push({ pr, category, context: extractChangeContext(pr.body) });
+    ranked.push({
+      pr,
+      category,
+      context: extractChangeContext(pr.body),
+      displayContext: extractChangeContext(cleanPullRequestBody(pr.body)),
+    });
   }
   return ranked.sort(
     (a, b) =>
@@ -1654,7 +1720,8 @@ export function buildEvolutionSlides(
   const windowShas = new Set(result.commits.map((c) => c.sha));
   const blocked = new Set<string>();
   for (const r of plan.deepDives) {
-    const lines = [...(r.context ? [r.context, ""] : []), `Merged ${isoDate(r.pr.mergedAt)}`];
+    // Display-only PR_Display_Context (Req 7.26); relevance/selection used r.context.
+    const lines = [...(r.displayContext ? [r.displayContext, ""] : []), `Merged ${isoDate(r.pr.mergedAt)}`];
     slides.push(makeSlide("change", `${r.category} · ${r.pr.title} (#${r.pr.number})`, lines.join("\n")));
     for (const sha of groups.prMembers.get(r.pr.number) ?? []) blocked.add(sha);
     for (const sha of evidence[r.pr.number] ?? []) if (windowShas.has(sha)) blocked.add(sha);
