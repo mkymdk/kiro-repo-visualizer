@@ -18,6 +18,8 @@ import {
   buildRunSlide,
   buildArchitectureSlide,
   extractHowItWorks,
+  userStoryActionPhrase,
+  buildCapabilitiesSlide,
   parseFeatureItem,
   extractKeyFeatures,
   buildFeatureSlides,
@@ -82,6 +84,12 @@ function makeResult(overrides: Partial<RepoAnalysisResult> = {}): RepoAnalysisRe
   };
 }
 
+/** Capitalize the first letter and drop a trailing sentence mark, matching the module's behavior. */
+function capitalizeFirst(text: string): string {
+  const t = text.trim().replace(/[.,;]+$/, "");
+  return t.length > 0 ? t[0]!.toUpperCase() + t.slice(1) : t;
+}
+
 /** Decode the storyboard's HTML escaping. */
 function decode(text: string): string {
   return text
@@ -112,6 +120,156 @@ function anchorsFor(result: RepoAnalysisResult): Set<string> {
     how?.headings ?? [],
   );
 }
+
+// ---------------------------------------------------------------------------
+// Semantic/story quality (Cycle B2a: B2a-1, B2a-2, Properties 26–27)
+// ---------------------------------------------------------------------------
+
+describe("B2a-1: userStoryActionPhrase (Property 26)", () => {
+  it("transforms the two recognized grammar forms", () => {
+    expect(userStoryActionPhrase("to submit a GitHub repository URL")).toBe("Submit a GitHub repository URL");
+    expect(userStoryActionPhrase("the System to automatically analyze a repository")).toBe("Automatically analyze a repository");
+    expect(userStoryActionPhrase("the video to explain how the repository works")).toBe("Explain how the repository works");
+    expect(userStoryActionPhrase("The System to render frames.")).toBe("Render frames"); // case + trailing punctuation
+  });
+
+  it("preserves unsupported subjects, object clauses, and plain noun phrases", () => {
+    for (const clause of [
+      "the application to export CSV files",
+      "the parser to be fast",
+      "files to sync automatically",
+      "a fast parser",
+      "my data exported",
+    ]) {
+      expect(userStoryActionPhrase(clause), clause).toBe(capitalizeFirst(clause));
+    }
+  });
+
+  it("the Capabilities slide shows action-first text for spec stories", () => {
+    const caps = extractCapabilities("# x", kiroRepo.specDocs);
+    const body = decode(buildCapabilitiesSlide(caps).body);
+    expect(body).toContain("• Submit a GitHub repository URL");
+    expect(body).not.toContain("the System to");
+    expect(body).not.toContain("I want");
+  });
+
+  it("display wording does not change selection, order, dedup, or overlap", () => {
+    // Two stories whose action phrases collide but whose raw clauses differ:
+    // dedup must key on the raw clause, so both survive in document order.
+    const specDocs = [
+      {
+        path: ".kiro/specs/x/requirements.md",
+        content: [
+          "# Requirements",
+          "**User Story:** As a User, I want the System to export data, so that I can share it.",
+          "**User Story:** As a User, I want the video to export data, so that viewers see it.",
+        ].join("\n"),
+      },
+    ];
+    const caps = extractCapabilities(null, specDocs);
+    // Dedup keys on the raw clause: both distinct stories survive, in document order.
+    // Keying on the display Action_Phrase would collapse them to one ("Export data").
+    expect(caps).toEqual(["The System to export data", "The video to export data"]);
+    const displayKeys = new Set(caps.map((c) => userStoryActionPhrase(c).toLowerCase()));
+    expect(displayKeys.size).toBe(1); // display collides…
+    expect(caps.length).toBe(2); // …but selection kept both.
+  });
+});
+
+describe("B2a-2: spec How-it-works prose fallback (Property 27)", () => {
+  const doc = (content: string, path = ".kiro/specs/x/design.md"): SpecDocument => ({ path, content });
+
+  it("prefers design/architecture/decision prose when present", () => {
+    const how = extractHowItWorks(null, [doc("# Design\n\n## Architecture\n\nIt parses then renders. Simple.")]);
+    expect(how?.body).toContain("It parses then renders.");
+  });
+
+  it("falls back to Overview/Components prose when no design section has prose", () => {
+    const content = [
+      "# Design Doc",
+      "",
+      "## Overview",
+      "",
+      "The system turns a repository into a narrated video for viewers.",
+      "",
+      "## Components",
+      "",
+      "- analyzer",
+    ].join("\n");
+    const how = extractHowItWorks(null, [doc(content)])!;
+    expect(how.body).toContain("The system turns a repository into a narrated video");
+    expect(how.body.split("\n")[0]).toBe("Design Doc");
+  });
+
+  it("stays heading-only when headings exist but no eligible prose does", () => {
+    const content = [
+      "# Spec",
+      "",
+      "## Glossary",
+      "",
+      "**Term**: a definition line.",
+      "",
+      "## Requirements",
+      "",
+      "THE System SHALL do a thing.",
+      "WHEN x, THE System SHALL y.",
+      "Requirement 1: Something",
+      "",
+      "## Table",
+      "",
+      "| a | b |",
+      "| - | - |",
+    ].join("\n");
+    const how = extractHowItWorks(null, [doc(content, ".kiro/specs/x/requirements.md")])!;
+    // Headings present, but no prose sentence line.
+    expect(how.body).toContain("•");
+    expect(how.body).not.toMatch(/SHALL|definition line|Something/);
+  });
+
+  it("rejects code blocks and single-word labels as prose", () => {
+    const content = [
+      "# Doc",
+      "",
+      "## Setup",
+      "",
+      "```",
+      "run the parser now",
+      "```",
+      "",
+      "## Notes",
+      "",
+      "TODO",
+    ].join("\n");
+    const how = extractHowItWorks(null, [doc(content)])!;
+    expect(how.body).not.toContain("run the parser now"); // code block
+    expect(how.body).not.toMatch(/\bTODO\b/); // single-word label
+  });
+
+  it("returns null when there are neither headings nor prose", () => {
+    expect(extractHowItWorks("# x", [doc("# OnlyTitle\n")])).toBeNull();
+  });
+
+  it("extracted prose is source-derived and leaves headings/anchors unchanged", () => {
+    const content = [
+      "# Design Doc",
+      "",
+      "## Overview",
+      "",
+      "The engine streams frames to the encoder efficiently.",
+      "",
+      "## Components",
+      "",
+      "### Analyzer",
+    ].join("\n");
+    const before = extractHowItWorks(null, [doc(content)])!;
+    const corpus = content.toLowerCase();
+    const lastSentence = before.body.split("\n").pop()!;
+    expect(corpus).toContain(lastSentence.toLowerCase().replace(/\s+/g, " ").trim().replace(/[.]$/, "").toLowerCase());
+    // Headings used for anchors are the section headings, not the prose.
+    expect(before.headings).toContain("Overview");
+    expect(before.headings).toContain("Components");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Extraction quality (Candidate B: B1–B6b, Properties 19–25)

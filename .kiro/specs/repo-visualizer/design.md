@@ -159,10 +159,10 @@ Shared helpers:
 | Slide (`type`) | Primary source | Fallback | Bounds | Omitted when |
 |---|---|---|---|---|
 | Overview (`intro`) | Repo name + `metadata.description` + `metadata.topics` + first README prose paragraph (skips heading, badge/image, HTML, and blank lines) | Name + "No description available." | `introMaxWords` | never |
-| Capabilities (`capabilities`) | README section `Capabilities \| What it does \| What you can do \| Use Cases` → list items, else sentences | Spec user stories: the `I want …` clause of `As a …, I want …, so that …` lines (a leading `**User Story:**` is stripped), document order | `capabilitiesMaxItems`, `capabilityMaxWords` | no source, or overlap > `capabilitiesMaxOverlapRatio` (see below) |
+| Capabilities (`capabilities`) | README section `Capabilities \| What it does \| What you can do \| Use Cases` → list items, else sentences | Spec user stories: the Action_Phrase of the `I want …` clause of `As a …, I want …, so that …` lines (a leading `**User Story:**` is stripped; see Semantic/story quality, B2a-1), document order | `capabilitiesMaxItems`, `capabilityMaxWords` | no source, or overlap > `capabilitiesMaxOverlapRatio` (see below) |
 | Run (`run`) | README section `Install \| Installation \| Getting Started \| Setup \| Usage \| Quick Start \| Example \| Examples` (first match in document order; see Extraction quality, B4) | — | `runMaxSteps`, `runMaxWordsPerStep` | no match |
 | Architecture (`architecture`) | Top-level tree, directories first (unchanged) | Placeholder text | — | never |
-| How it works (`howItWorks`) | README section `How it works \| Architecture \| Design` → heading + sentences | Spec docs, `design.md` preferred: title, headings, sentences from design/architecture/decision sections (existing spec-slide logic) | `specMaxHeadings`, `specMaxSentences` | no source |
+| How it works (`howItWorks`) | README section `How it works \| Architecture \| Design` → heading + sentences | Spec docs, `design.md` preferred: title, headings, sentences from design/architecture/decision sections, else the first substantive Explanatory_Prose run (see Semantic/story quality, B2a-2) | `specMaxHeadings`, `specMaxSentences` | no source |
 | Key features (`feature`) | README section `Features \| Key Features \| Highlights` → list items parsed as `**Name** — desc`, `**Name**: desc`, `Name: desc`, or `Name - desc` | design.md `…Components…` section subheadings + first sentence; then `Requirement N: Title` headings (name only) | `maxFeatureSlides`, `featureMaxWords` | no source |
 
 "Usage" belongs to the Run slide only and is never a capabilities heading.
@@ -388,6 +388,41 @@ Six narrow fixes, all inside `storyboard.ts`. Each policy is its own small pure 
 - B1: a calendar-style tag with no leading zeros that otherwise satisfies the tag shape (for example `2024.1.15`) is classified as a semantic version, and as a patch when its third component is above 0.
 - B5: a standalone numeric token in the configured year range (1900–2099), such as `2048` or `2049`, is treated as calendar noise even when it is a meaningful technical value. Numbers outside that range and mixed alphanumeric terms (`es2022`, `http2`, `1080p`) stay eligible. No generic numeric classification is introduced.
 - B6b: deduplication is deterministic normalized equality only. Two sentences that differ by meaningful words are both kept, so `chalk is a styling library` is not collapsed into a bare `A styling library` description. This false-negative bias is intentional.
+
+#### Semantic/story quality (Cycle B2a, Req 5.4, 5.13, 6.3, 6.10)
+
+Two narrow fixes, both inside `storyboard.ts`. No analyzer, config, GitHub-request, classification, ordering, slide-cap, or Change_Group change.
+
+| Item | Helper (new or changed) | Called from | Stage |
+|---|---|---|---|
+| B2a-1 | `userStoryActionPhrase(clause)` (new) | `extractCapabilities` (spec-story branch only) | Stage 1 capabilities |
+| B2a-2 | `isExplanatoryProse(line)` (new), `specExplanatoryProse(docs)` (new) | `extractHowItWorks` spec fallback | Stage 1 how-it-works |
+
+**B2a-1. Capability phrasing (Req 5.4, 5.13).**
+- *Current failure:* `extractCapabilities` captures the raw "I want" clause via `USER_STORY_RE` and only strips a leading `to`. A story like "As a User, I want the System to automatically analyze a repository, so that …" yields `The System to automatically analyze a repository`, which reads as a fragment. All seven user stories in `requirements.md`, and two of three in the kiro fixture, use this `I want <subject> to …` form.
+- *Grammar (closed, no noun-phrase guessing):* `userStoryActionPhrase(clause)` receives the text already captured by `USER_STORY_RE` (everything after "I want", before "so that"). It recognizes exactly two shapes:
+  1. a leading `to ` → the remainder is the Action_Phrase (today's behavior, kept);
+  2. a leading `System_Subject` followed by ` to ` → the remainder after that `to` is the Action_Phrase. `SYSTEM_SUBJECTS` is a conservative, evidence-based set with exactly two members: `the system` and `the video`, matched case-insensitively at the very start, immediately followed by ` to `. (`the application`, `the app`, `the tool`, `the service`, `the website` are deliberately excluded — no current fixture or spec uses them.)
+
+  Any other clause (plain noun phrase, unrecognized subject such as `the application`/`the parser` before `to`, or no `to`) is returned unchanged. The result is capitalized and loses a trailing `.`/`,`/`;`, exactly as now.
+- *Why a closed subject set, not "noun phrase before to":* stripping any text before `to` changes meaning — "I want files to sync" would wrongly become "sync". The closed set only removes grammatical subjects that denote the software, so the phrase stays an accurate capability.
+- *Where normalization happens relative to dedup/overlap:* the transform is applied to **display text only**, inside the spec-story branch, before the existing dedup loop. To keep selection identical, the dedup key and the overlap comparison must be unaffected by the wording change. Chosen approach (option 3): the spec-story branch keeps both the raw clause and the Action_Phrase; dedup continues to key on `normalize(rawClause)` and `capabilitiesOverlapFeatures` continues to receive the same list it does today in terms of selection, while the stored/displayed string is the Action_Phrase. In practice the simplest implementation that preserves this is to compute the Action_Phrase and use it for display and truncation, but dedup on the normalized Action_Phrase only if that provably cannot change which items survive; the design mandates proving this with a test (Property 26's overlap case) and, if it cannot be shown, keying dedup on the raw clause. README-sourced capabilities are untouched.
+- *False-positive protection:* only the two grammar shapes transform; the subject must be the whole lead-in before ` to `. "I want files to sync automatically" is a plain clause (no leading `to`, no recognized subject) and is kept verbatim.
+- *Fallback:* ambiguous or unrecognized clauses are preserved unchanged.
+
+**B2a-2. Spec how-it-works prose (Req 6.3, 6.10).**
+- *Current failure:* the spec fallback only pulls sentences from sections whose heading matches `design|architecture|decision`. Specs whose explanatory content lives under "Overview", "Components", or "Data Flow" (as in this repository's own `design.md`) match no such heading, so `sentences` stays empty and the slide is headings-only.
+- *Preferred path (unchanged order):* (1) README how-it-works section prose; (2) spec sections matching `design|architecture|decision`; (3) new deterministic fallback.
+- *Fallback rule:* when (1) and (2) yield no sentences, `specExplanatoryProse(designFirst(specDocs))` scans documents in the existing `designFirst` order and, within each, lines in document order, and returns the first run of consecutive Explanatory_Prose lines. `isExplanatoryProse(line)` builds on the existing `isProseLine` (which already rejects headings, lists, tables, fences, HTML, badges, and blank lines) and additionally rejects, after reducing the line to plain text:
+  - requirement/EARS lines: `/^(the system shall|when |if |while )/i`, or a `^Requirement \d+:` / `^User Story:` lead-in;
+  - Glossary definition lines: a bold or backticked term immediately followed by a colon (`/^\*\*[^*]+\*\*\s*:/` or `` /^`[^`]+`\s*:/ ``);
+  - single-token labels: plain text with no internal whitespace (fewer than two words).
+
+  The matched run is passed through the existing `firstSentences(sectionProse(...), specMaxSentences)`.
+- *Why not "first paragraph in the file":* the first lines are usually the title and front matter; the rule skips to the first substantive paragraph instead, using the same classifier the overview slide already relies on.
+- *No numeric threshold:* the earlier draft proposed a `HOW_IT_WORKS_MIN_PROSE_CHARS` floor; it is **removed**. "Substantive" is decided structurally — a line survives only if it is prose, is not an EARS/requirement/glossary line, and is more than one word. No character count and therefore no new constant (governed or otherwise).
+- *Headings and anchors unchanged:* the fallback only fills the sentence portion. The heading list, `HowItWorks.headings`, and therefore the Anchor_Terms are byte-identical to today.
+- *Fallback of the fallback:* if no document contains Explanatory_Prose, the slide stays headings-only (Req 6.10). If there are no headings and no prose, `extractHowItWorks` returns null as now.
 
 ---
 
@@ -846,6 +881,31 @@ For any analysis result whose text fields contain Emoji_Shortcodes, no generated
 The overview's README paragraph never contains a sentence whose normalized form equals the normalized description or one of its sentences, and every README sentence that is not such a duplicate is kept (subject to the word cap).
 
 **Validates: Requirements 5.1, 5.12**
+
+### Property 26: Capability Phrasing Is a Deterministic, Conservative Grammar Transform
+
+For capabilities sourced from spec user stories:
+- "I want to <action>", "I want the System to <action>", and "I want the video to <action>" yield exactly "<action>" (capitalized, trailing sentence punctuation removed);
+- any other "I want" clause — a plain noun phrase ("a fast parser"), an unrecognized subject before "to" ("the application to export CSV files", "the parser to be fast"), an object clause ("files to sync automatically"), or a clause without "to" — is preserved verbatim;
+- the transform never substitutes words, changes tense, or deletes an arbitrary noun phrase before "to";
+- for the same analysis result, the set of selected user stories, their order, dedup, and the Capabilities-versus-Key_Feature overlap outcome are identical to the pre-B2a behavior; only the displayed/truncated text differs. This is demonstrated with a case where using the transformed display text as the dedup/overlap key would change the result, proving selection keys on the raw clause.
+
+Negative cases explicitly cover `the application` (not in the two-member set) and object clauses that must not be stripped.
+
+**Validates: Requirements 5.4, 5.5, 5.13**
+
+### Property 27: Spec How-it-works Includes Prose When the Spec Has Any
+
+For the spec-based how-it-works fallback:
+- WHEN the Spec_Documentation contains eligible Explanatory_Prose (whether or not it sits under a design/architecture/decision heading), the extracted slide body includes at least one prose sentence that is a substring of the source spec, and is not heading-only;
+- preferred design/architecture/decision prose still wins when present; Overview/Components-style prose is reached only through the new fallback;
+- requirement/EARS lines, Glossary definitions, table rows, and fenced-code lines are never selected;
+- WHEN the Spec_Documentation contains headings but no eligible Explanatory_Prose, the result is the deterministic headings-only body, with no invented text;
+- WHEN there are neither headings nor prose, extraction returns null;
+- every sentence in the result is a substring of the source corpus (source-derived, not generated; Property 8 still holds);
+- the heading list and the derived Anchor_Terms are byte-identical to the pre-B2a behavior.
+
+**Validates: Requirements 6.2, 6.3, 6.10**
 
 ---
 
