@@ -1141,6 +1141,18 @@ const CATEGORY_RANK: Record<ChangeCategory, number> = {
 /** Conventional-commit prefix: `type(scope)!:`. */
 const CONVENTIONAL_RE = /^(\w+)(?:\([^)]*\))?(!)?:/;
 
+/**
+ * Recognized conventional-commit types and their Change_Category. `perf` maps
+ * to `Refactor` (B2b). The `!` breaking marker promotes only these recognized
+ * types; an unknown type with `!` is not treated as Breaking (Req 7.2).
+ */
+const CONVENTIONAL_TYPE_CATEGORIES: Readonly<Record<string, ChangeCategory>> = {
+  feat: "Feature",
+  fix: "Bug Fix",
+  refactor: "Refactor",
+  perf: "Refactor",
+};
+
 /** Keyword → category mapping, used by earliest match in the title. */
 const KEYWORD_CATEGORIES: ReadonlyArray<[string, ChangeCategory]> = [
   ["feat", "Feature"],
@@ -1160,11 +1172,13 @@ const KEYWORD_CATEGORIES: ReadonlyArray<[string, ChangeCategory]> = [
 export function categoryFromTitle(title: string): ChangeCategory | null {
   const conv = CONVENTIONAL_RE.exec(title);
   if (conv) {
-    if (conv[2] === "!") return "Breaking Change";
     const type = conv[1]!.toLowerCase();
-    if (type === "feat") return "Feature";
-    if (type === "fix") return "Bug Fix";
-    if (type === "refactor") return "Refactor";
+    const category = CONVENTIONAL_TYPE_CATEGORIES[type];
+    if (category) {
+      // The `!` breaking marker promotes only a recognized conventional type;
+      // an unknown `type!:` falls through to keyword matching (B2b, Req 7.2).
+      return conv[2] === "!" ? "Breaking Change" : category;
+    }
   }
   const lower = title.toLowerCase();
   let best: { index: number; category: ChangeCategory } | null = null;
@@ -1186,7 +1200,7 @@ export function categorizePullRequest(pr: PullRequest): ChangeCategory | null {
   if (labels.has("breaking-change") || labels.has("breaking")) return "Breaking Change";
   if (labels.has("feature") || labels.has("enhancement")) return "Feature";
   if (labels.has("bug")) return "Bug Fix";
-  if (labels.has("refactor")) return "Refactor";
+  if (labels.has("refactor") || labels.has("performance") || labels.has("perf")) return "Refactor";
   return categoryFromTitle(pr.title);
 }
 
@@ -1500,7 +1514,7 @@ export function isDocsCommit(subject: string): boolean {
 }
 
 /** Keyword pattern for relevance-path Engineering_Highlights (Req 7.9). */
-const HIGHLIGHT_RE = /feat|fix|refactor|add|implement|redesign/i;
+const HIGHLIGHT_RE = /feat|fix|refactor|perf|add|implement|redesign/i;
 
 /**
  * Select Engineering_Highlight commits.

@@ -1100,3 +1100,39 @@ Selected PR identities/order must stay: `Add preserveTrailingDash option (#57)`,
 - Fixtures are synthetic except the `slugify` acceptance, which uses captured data; no new GitHub requests.
 
 **Scope guard:** if any change is needed outside `storyboard.ts`, or would touch `ChangeCategory`, release cleaning, Q2 semantics, ranking, caps, Change_Groups, or request behavior, stop and report.
+
+---
+
+# Implementation Plan: Performance-Change Classification (B2b, final storyboard cycle)
+
+## Overview
+
+Classify conventional `perf` changes with the existing `ChangeCategory` model and fix the over-broad `!`→Breaking rule. Req 7.2, 7.9; Property 34. `storyboard.ts` only. No new category, no `CATEGORY_RANK`/allocation/cap/Change_Group/anchor/Q2/PR-sanitation/request change.
+
+Branch `fix/performance-change-classification` from `main`. Commits: (1) `docs:` specs; (2) `fix:` implementation + tests.
+
+## Tasks
+
+- [ ] 48. `perf` classification + breaking-marker fix (Req 7.2, 7.9)
+  - [ ] 48.1 `categoryFromTitle`: map recognized conventional types explicitly; `perf` → Refactor; `!`→Breaking only for a recognized type (feat/fix/refactor/perf). Unknown `type!:` falls through to keyword matching.
+  - [ ] 48.2 `categorizePullRequest`: add `performance`/`perf` labels → Refactor (mirroring `refactor`).
+  - [ ] 48.3 `HIGHLIGHT_RE`: add `perf` so conventional `perf:` commits can be highlights.
+- [ ] 49. Tests + validation
+  - [ ] 49.1 Cases: `perf:`, `perf(scope):` → Refactor; `perf!:`, `perf(scope)!:` → Breaking; unknown `wibble!:` → not Breaking; `performance`/`perf` labels → Refactor; `perf:` commit highlight; regression of feat/fix/refactor/feat!/existing labels.
+  - [ ] 49.2 One property (34). Type-check, full suite, build, mutation checks, governed-literal scan, `git diff --check`, traceability (Req 7 1–26, Properties 1–34).
+
+## Mutation Plan
+
+| Mutation | Killed by |
+|---|---|
+| `perf` not mapped (falls through) | `perf:` → Refactor test |
+| `perf!` not Breaking | `perf!:` → Breaking test |
+| restore blanket `!`→Breaking for any type | unknown `wibble!:` test |
+| drop `perf` from HIGHLIGHT_RE | `perf:` commit-highlight test |
+| drop `performance`/`perf` labels | label → Refactor test |
+
+## Notes
+- No new governed constants. `storyboard.ts` only.
+- After this cycle the storyboard heuristic pipeline is considered mature.
+
+**Scope guard:** if anything beyond `storyboard.ts` (e.g. `ChangeCategory`, `CATEGORY_RANK`) seems required, stop and report.

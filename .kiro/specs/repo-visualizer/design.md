@@ -189,6 +189,8 @@ Anchor terms come only from current-state content. Commits, PRs, and releases ne
 
 `extractChangeContext(text)` removes HTML comments (multi-line), task-list lines (`- [ ]`, `- [x]`), heading lines, fenced code blocks, and trailer lines (`^[A-Za-z][A-Za-z-]*: .+$`). It applies `toPlainText`, takes the first sentence, and truncates to `changeContextMaxWords`. It returns `null` when nothing remains.
 
+**Performance changes (B2b, Req 7.2, 7.9).** `perf` joins the recognized conventional types mapped to `Refactor`: `categoryFromTitle` returns `Refactor` for `perf:`/`perf(scope):` and `Breaking Change` for `perf!:`/`perf(scope)!:`. The `!`→Breaking rule applies **only** to a recognized conventional type (`feat`, `fix`, `refactor`, `perf`); an unknown `type!:` (e.g. `wibble!:`) is no longer promoted to Breaking by the bang alone — it falls through to keyword matching like any other title. The `performance` and `perf` PR labels map to `Refactor` on the label path, mirroring the existing `refactor` label. `HIGHLIGHT_RE` gains `perf` so conventional `perf:` commits can be Engineering_Highlights. No new `ChangeCategory`, no change to `CATEGORY_RANK` or allocation; `perf` evidence ranks exactly as `Refactor`.
+
 | Candidate | Eligibility | Category | Order |
 |---|---|---|---|
 | Significant_PR (7.1) | `!isBot`; title not `^(chore\|docs\|ci\|style\|test\|build)(\(.+\))?!?:`; no `bump\|deps\|dependency\|dependencies`; category assignable | labels → conventional prefix → first keyword (7.2) | Breaking Change > Feature > Bug Fix > Refactor, then newest merge |
@@ -1004,6 +1006,12 @@ For identical analyzer input, adding PR display sanitation leaves unchanged: the
 When `cleanPullRequestBody(pr.body)` removes no targeted structural line, `displayContext` equals `context` and the PR deep-dive slide is byte-identical to the pre-sanitation output. Anchored repositories whose PR bodies carry no targeted noise are therefore unchanged, and their relevance/selection is unchanged regardless.
 
 **Validates: Requirements 7.26**
+
+### Property 34: Performance Changes Are Classified as Refactor, Honoring the Breaking Marker
+
+`perf:` and `perf(scope):` titles (and `performance`/`perf` labels) are categorized as `Refactor`; `perf!:` and `perf(scope)!:` are `Breaking Change`. The `!`→Breaking rule fires only for a recognized conventional type (`feat`, `fix`, `refactor`, `perf`): an unknown `type!:` is not promoted to Breaking by the bang alone. A conventional `perf:` commit is eligible as an Engineering_Highlight. The existing Breaking Change / Feature / Bug Fix / Refactor classifications, `CATEGORY_RANK`, and allocation are unchanged, and no new category is introduced.
+
+**Validates: Requirements 7.2, 7.9**
 
 ---
 
